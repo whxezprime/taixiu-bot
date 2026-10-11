@@ -43,7 +43,7 @@ const cardTiers = {
     4: { name: 'Thẻ Infinite', maxLoan: 5000, upgradeCost: 2000 }
 };
 
-client.once('ready', () => {
+client.once('clientReady', () => {
     console.log(`Bot đã đăng nhập thành công với tên ${client.user.tag}!`);
 });
 
@@ -51,11 +51,13 @@ client.on('messageCreate', async message => {
     if (message.author.bot) return;
 
     const args = message.content.trim().split(/ +/);
-    const command = args.shift().toLowerCase();
+    let rawCommand = args.shift().toLowerCase();
+    // Tự động bỏ dấu ! nếu người dùng gõ kèm vào lệnh để tránh lệch cú pháp
+    const command = rawCommand.startsWith('!') ? rawCommand.slice(1) : rawCommand;
     const userId = message.author.id;
 
-    // 1. Lệnh !helptaixiu
-    if (command === '!helptaixiu') {
+    // 1. Lệnh helptaixiu
+    if (command === 'helptaixiu') {
         return message.reply(
             `📖 **HƯỚNG DẪN HỆ THỐNG GAME & HỌC TẬP** 📖\n` +
             `• \`!dangky\` - Đăng ký tài khoản (Nhận 100 vnđ).\n` +
@@ -70,8 +72,8 @@ client.on('messageCreate', async message => {
         );
     }
 
-    // 2. Lệnh !dangky
-    if (command === '!dangky') {
+    // 2. Lệnh dangky
+    if (command === 'dangky') {
         if (usersData[userId]) {
             return message.reply('❌ Bạn đã có tài khoản rồi!');
         }
@@ -92,9 +94,9 @@ client.on('messageCreate', async message => {
         return message.reply('✅ Đăng ký thành công! Bạn nhận được **100 vnđ** và bắt đầu ở **Cấp học 1**.');
     }
 
-    const restrictedCommands = ['!taixiu', '!vaynganhang', '!tranganhang', '!nangcapthenganhang', '!bank', '!dilam', '!dihoc', '!traloi'];
+    const restrictedCommands = ['taixiu', 'vaynganhang', 'tranganhang', 'nangcapthenganhang', 'bank', 'dilam', 'dihoc', 'traloi', 'hoso'];
     
-    if (restrictedCommands.includes(command) || command === '!hoso') {
+    if (restrictedCommands.includes(command)) {
         if (!usersData[userId]) {
             return message.reply('⚠️ Bạn chưa có tài khoản! Vui lòng dùng lệnh `!dangky` trước.');
         }
@@ -108,7 +110,7 @@ client.on('messageCreate', async message => {
         return message.reply(`🔒 Bạn đang ngồi tù! Còn khoảng **${remainingMinutes} phút** nữa mới được thả.`);
     }
 
-    // 3. Lệnh !dihoc
+    // 3. Lệnh dihoc
     if (command === 'dihoc') {
         if (user.eduLevel > 3) {
             return message.reply(`🎓 Bạn đã tốt nghiệp toàn bộ các cấp và học tại **${user.university}** rồi! Không cần đi học nữa.`);
@@ -157,7 +159,7 @@ client.on('messageCreate', async message => {
         );
     }
 
-    // 4. Lệnh !traloi
+    // 4. Lệnh traloi
     if (command === 'traloi') {
         if (!user.activeQuestion) {
             return message.reply('❌ Bạn không có câu hỏi nào cần trả lời lúc này! Dùng `!dihoc` để lấy bài tập.');
@@ -212,7 +214,7 @@ client.on('messageCreate', async message => {
         }
     }
 
-    // 5. Lệnh !taixiu
+    // 5. Lệnh taixiu
     if (command === 'taixiu') {
         const currentTierInfo = cardTiers[user.tier];
         if (user.debt >= currentTierInfo.maxLoan && user.debt > 0) {
@@ -253,7 +255,7 @@ client.on('messageCreate', async message => {
         return message.reply(replyMsg);
     }
 
-    // 6. Lệnh !hoso
+    // 6. Lệnh hoso
     if (command === 'hoso') {
         let targetUser = message.mentions.users.first() || message.author;
         let targetId = targetUser.id;
@@ -279,7 +281,7 @@ client.on('messageCreate', async message => {
         );
     }
 
-    // 7. Lệnh !vaynganhang
+    // 7. Lệnh vaynganhang
     if (command === 'vaynganhang') {
         const loanAmount = parseInt(args[0]);
         if (isNaN(loanAmount) || loanAmount <= 0) return message.reply('❌ Nhập số tiền vay hợp lệ!');
@@ -295,7 +297,7 @@ client.on('messageCreate', async message => {
         return message.reply(`✅ Vay thành công **${loanAmount.toLocaleString()} vnđ**! Tổng nợ: **${user.debt}/${tierInfo.maxLoan} vnđ**`);
     }
 
-    // 8. Lệnh !tranganhang
+    // 8. Lệnh tranganhang
     if (command === 'tranganhang') {
         const payAmount = parseInt(args[0]);
         if (isNaN(payAmount) || payAmount <= 0) return message.reply('❌ Nhập số tiền trả hợp lệ!');
@@ -313,7 +315,7 @@ client.on('messageCreate', async message => {
         return message.reply(msg);
     }
 
-    // 9. Lệnh !nangcapthenganhang
+    // 9. Lệnh nangcapthenganhang
     if (command === 'nangcapthenganhang') {
         if (user.tier >= 4) return message.reply('🏆 Thẻ đã đạt cấp tối đa (Infinite)!');
         const nextTier = user.tier + 1;
@@ -329,7 +331,7 @@ client.on('messageCreate', async message => {
         return message.reply(`🎉 Nâng cấp thành công lên **${nextTierInfo.name}**! Hạn mức mới: **${nextTierInfo.maxLoan} vnđ**.`);
     }
 
-    // 10. Lệnh !bank
+    // 10. Lệnh bank
     if (command === 'bank') {
         const targetUser = message.mentions.users.first();
         const transferAmount = parseInt(args[1]);
@@ -346,7 +348,7 @@ client.on('messageCreate', async message => {
         return message.reply(`✅ Đã chuyển **${transferAmount.toLocaleString()} vnđ** cho **${targetUser.username}**!`);
     }
 
-    // 11. Lệnh !dilam
+    // 11. Lệnh dilam
     if (command === 'dilam') {
         const job = args[0] ? args[0].toLowerCase() : '';
         if (!['anxin', 'ancuop'].includes(job)) {
@@ -406,5 +408,6 @@ client.on('messageCreate', async message => {
     }
 });
 
-// Sử dụng biến môi trường DISCORD_TOKEN để bảo mật
-client.login(process.env.DISCORD_TOKEN);
+// Đăng nhập bot (giữ nguyên token trực tiếp của bạn vào đây)
+client.login('MTU1Mjk3NjYwMzIyMTMzMjAwOA.GAHFJU.mbwMNVGByXz3qEcavt7BGFvdG8PbGQk2usYK3Q');
+        
