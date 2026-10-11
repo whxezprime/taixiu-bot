@@ -1,0 +1,2 @@
+cd ~/discord-taixiu
+echo "{}" > users.json
