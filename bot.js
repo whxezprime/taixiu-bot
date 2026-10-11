@@ -409,5 +409,4 @@ client.on('messageCreate', async message => {
 });
 
 // Đăng nhập bot (giữ nguyên token trực tiếp của bạn vào đây)
-client.login('MTU1Mjk3NjYwMzIyMTMzMjAwOA.GAHFJU.mbwMNVGByXz3qEcavt7BGFvdG8PbGQk2usYK3Q');
-        
+client.login(process.env.DISCORD_TOKEN);
