@@ -1,12 +1,12 @@
 {
-  "name": "discord-taixiu-bot",
+  "name": "taixiu-bot",
   "version": "1.0.0",
-  "description": "Bot Tai Xiu Discord tren Termux",
+  "description": "Discord Bot Roleplay & Taixiu",
   "main": "bot.js",
   "scripts": {
     "start": "node bot.js"
   },
   "dependencies": {
-    "discord.js": "^14.14.1"
+    "discord.js": "^14.14.0"
   }
 }
