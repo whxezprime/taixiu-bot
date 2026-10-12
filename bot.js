@@ -1,233 +1,413 @@
+const { Client, GatewayIntentBits } = require('discord.js');
 const fs = require('fs');
-const { Client, GatewayIntentBits, Partials } = require('discord.js');
-
 const client = new Client({
     intents: [
         GatewayIntentBits.Guilds,
         GatewayIntentBits.GuildMessages,
         GatewayIntentBits.MessageContent,
-        GatewayIntentBits.GuildMembers,
-    ],
-    partials: [Partials.Channel, Partials.Message, Partials.Reaction]
+        GatewayIntentBits.GuildModeration
+    ]
 });
 
+// Đường dẫn file lưu trữ dữ liệu
 const DATA_FILE = './users.json';
-const PREFIX = '!';
 
+let usersData = {};
 function loadData() {
-    if (!fs.existsSync(DATA_FILE)) {
-        fs.writeFileSync(DATA_FILE, '{}');
+    if (fs.existsSync(DATA_FILE)) {
+        try {
+            const data = fs.readFileSync(DATA_FILE, 'utf8');
+            usersData = JSON.parse(data);
+        } catch (err) {
+            console.error('Lỗi đọc file dữ liệu:', err);
+            usersData = {};
+        }
     }
+}
+
+function saveData() {
     try {
-        const data = fs.readFileSync(DATA_FILE, 'utf8');
-        return JSON.parse(data);
+        fs.writeFileSync(DATA_FILE, JSON.stringify(usersData, null, 2), 'utf8');
     } catch (err) {
-        return {};
+        console.error('Lỗi ghi file dữ liệu:', err);
     }
 }
 
-function saveData(data) {
-    fs.writeFileSync(DATA_FILE, JSON.stringify(data, null, 2));
-}
+loadData();
 
-function sendAutoDeleteMessage(message, content) {
-    message.reply(content).then(sentMsg => {
-        setTimeout(() => {
-            sentMsg.delete().catch(() => {});
-        }, 10000);
-    });
-}
+// Cấu hình thẻ ngân hàng
+const cardTiers = {
+    1: { name: 'Thẻ thành viên', maxLoan: 200, upgradeCost: 0 },
+    2: { name: 'Thẻ Thông gia', maxLoan: 500, upgradeCost: 100 },
+    3: { name: 'Thẻ gold', maxLoan: 1000, upgradeCost: 1000 },
+    4: { name: 'Thẻ Infinite', maxLoan: 5000, upgradeCost: 2000 }
+};
 
-client.on('clientReady', () => {
-    console.log(`Bot đã đăng nhập thành công với tên: ${client.user.tag}`);
+client.once('clientReady', () => {
+    console.log(`Bot đã đăng nhập thành công với tên ${client.user.tag}!`);
 });
 
 client.on('messageCreate', async message => {
     if (message.author.bot) return;
 
-    let content = message.content.trim();
-    if (!content.startsWith(PREFIX)) return;
-
-    const args = content.slice(PREFIX.length).trim().split(/ +/);
-    const command = args.shift().toLowerCase();
-
-    let users = loadData();
+    const args = message.content.trim().split(/ +/);
+    let rawCommand = args.shift().toLowerCase();
+    // Tự động bỏ dấu ! nếu người dùng gõ kèm vào lệnh để tránh lệch cú pháp
+    const command = rawCommand.startsWith('!') ? rawCommand.slice(1) : rawCommand;
     const userId = message.author.id;
 
-    if (!users[userId]) {
-        users[userId] = {
-            balance: 100,
-            inventory: [],
-            jobs: { policeMisses: 0 },
-            cooldowns: { anxin: 0, anxinCount: 0, dilam: 0 }
-        };
+    // 1. Lệnh helptaixiu
+    if (command === 'helptaixiu') {
+        return message.reply(
+            `📖 **HƯỚNG DẪN HỆ THỐNG GAME & HỌC TẬP** 📖\n` +
+            `• \`!dangky\` - Đăng ký tài khoản (Nhận 100 vnđ).\n` +
+            `• \`!dihoc\` - Đi học / làm bài tập thăng cấp học vấn.\n` +
+            `• \`!traloi [đáp án]\` - Trả lời câu hỏi bài tập.\n` +
+            `• \`!taixiu [tai/xiu] [số tiền]\` - Đặt cược Tài hoặc Xỉu.\n` +
+            `• \`!hoso\` hoặc \`!hoso @user\` - Xem hồ sơ, bằng cấp, đại học.\n` +
+            `• \`!vaynganhang\` & \`!tranganhang\` - Ngân hàng & trả nợ.\n` +
+            `• \`!nangcapthenganhang\` - Nâng cấp thẻ ngân hàng.\n` +
+            `• \`!bank @user [số tiền]\` - Chuyển tiền cho người khác.\n` +
+            `• \`!dilam [anxin/ancuop]\` - Đi làm kiếm tiền (buff theo trường ĐH).`
+        );
     }
-    let user = users[userId];
 
-    // 1. Lệnh đăng ký / tạo tài khoản: !dangky
+    // 2. Lệnh dangky
     if (command === 'dangky') {
-        return message.reply(`✅ Tài khoản của bạn đã được hệ thống ghi nhận! Số dư hiện tại: **${user.balance} VNĐ**.`);
+        if (usersData[userId]) {
+            return message.reply('❌ Bạn đã có tài khoản rồi!');
+        }
+
+        usersData[userId] = {
+            balance: 100,
+            username: message.author.username,
+            tier: 1,
+            debt: 0,
+            jailTime: 0,
+            eduLevel: 1,
+            eduProgress: 0,
+            activeQuestion: null,
+            university: null
+        };
+        saveData();
+
+        return message.reply('✅ Đăng ký thành công! Bạn nhận được **100 vnđ** và bắt đầu ở **Cấp học 1**.');
     }
 
-    // 2. Lệnh xem hồ sơ / số dư: !hoso hoặc !sodu hoặc !bal
-    if (command === 'hoso' || command === 'sodu' || command === 'bal') {
-        const inventoryList = user.inventory.length > 0 ? user.inventory.join(', ') : 'Trống';
+    const restrictedCommands = ['taixiu', 'vaynganhang', 'tranganhang', 'nangcapthenganhang', 'bank', 'dilam', 'dihoc', 'traloi', 'hoso'];
+    
+    if (restrictedCommands.includes(command)) {
+        if (!usersData[userId]) {
+            return message.reply('⚠️ Bạn chưa có tài khoản! Vui lòng dùng lệnh `!dangky` trước.');
+        }
+    }
+
+    const user = usersData[userId];
+
+    // Kiểm tra đi tù
+    if (user.jailTime && Date.now() < user.jailTime) {
+        const remainingMinutes = Math.ceil((user.jailTime - Date.now()) / 60000);
+        return message.reply(`🔒 Bạn đang ngồi tù! Còn khoảng **${remainingMinutes} phút** nữa mới được thả.`);
+    }
+
+    // 3. Lệnh dihoc
+    if (command === 'dihoc') {
+        if (user.eduLevel > 3) {
+            return message.reply(`🎓 Bạn đã tốt nghiệp toàn bộ các cấp và học tại **${user.university}** rồi! Không cần đi học nữa.`);
+        }
+
+        if (user.activeQuestion) {
+            return message.reply(`📝 Bạn đang có câu hỏi: **${user.activeQuestion.question}**\nHãy dùng lệnh \`!traloi <đáp án>\` để trả lời!`);
+        }
+
+        let num1, num2, answer, qText;
+
+        if (user.eduLevel === 1) {
+            num1 = Math.floor(Math.random() * 10) + 1;
+            num2 = Math.floor(Math.random() * 10) + 1;
+            answer = num1 + num2;
+            qText = `${num1} + ${num2} = ?`;
+        } else if (user.eduLevel === 2) {
+            const isMul = Math.random() < 0.5;
+            if (isMul) {
+                num1 = Math.floor(Math.random() * 9) + 2;
+                num2 = Math.floor(Math.random() * 9) + 2;
+                answer = num1 * num2;
+                qText = `${num1} × ${num2} = ?`;
+            } else {
+                num2 = Math.floor(Math.random() * 8) + 2;
+                const multiplier = Math.floor(Math.random() * 8) + 2;
+                num1 = num2 * multiplier;
+                answer = multiplier;
+                qText = `${num1} ÷ ${num2} = ?`;
+            }
+        } else if (user.eduLevel === 3) {
+            num1 = Math.floor(Math.random() * 20) + 5;
+            num2 = Math.floor(Math.random() * 10) + 2;
+            const num3 = Math.floor(Math.random() * 10) + 1;
+            answer = num1 + num2 * num3;
+            qText = `${num1} + ${num2} × ${num3} = ?`;
+        }
+
+        user.activeQuestion = { question: qText, answer: answer };
+        saveData();
+
         return message.reply(
-            `📄 **HỒ SƠ CÁ NHÂN**\n` +
-            `👤 Người chơi: ${message.author.username}\n` +
-            `💰 Số dư: **${user.balance} VNĐ**\n` +
-            `🎒 Kho đồ: [ ${inventoryList} ]`
+            `🏫 **BÀI HỌC CẤP ${user.eduLevel}** (Tiến độ: ${user.eduProgress}/5 câu đúng)\n` +
+            `❓ Câu hỏi: **${qText}**\n` +
+            `👉 Dùng lệnh \`!traloi [đáp án]\` để trả lời!`
         );
     }
 
-    // 3. Lệnh ăn xin: !anxin
-    if (command === 'anxin') {
-        const now = Date.now();
-        const twoHours = 2 * 60 * 60 * 1000;
-
-        if (now - user.cooldowns.anxin > twoHours) {
-            user.cooldowns.anxin = now;
-            user.cooldowns.anxinCount = 0;
+    // 4. Lệnh traloi
+    if (command === 'traloi') {
+        if (!user.activeQuestion) {
+            return message.reply('❌ Bạn không có câu hỏi nào cần trả lời lúc này! Dùng `!dihoc` để lấy bài tập.');
         }
 
-        if (user.cooldowns.anxinCount >= 5) {
-            return sendAutoDeleteMessage(message, `⏳ Bạn đã ăn xin quá 5 lần trong 2 giờ qua. Hãy nghỉ ngơi nhé!`);
+        const userAnswer = parseInt(args[0]);
+        if (isNaN(userAnswer)) {
+            return message.reply('❌ Vui lòng nhập số hợp lệ làm đáp án!');
         }
 
-        user.cooldowns.anxinCount += 1;
-        const earned = Math.floor(Math.random() * 6) + 5;
-        user.balance += earned;
-        saveData(users);
+        const correct = user.activeQuestion.answer;
+        if (userAnswer === correct) {
+            user.activeQuestion = null;
+            user.eduProgress += 1;
 
-        return message.reply(`乞 Bạn đi ăn xin và kiếm được **${earned} VNĐ**! (${user.cooldowns.anxinCount}/5 lần trong 2h qua).`);
-    }
+            let replyText = `✅ **Chính xác!** Tiến độ cấp ${user.eduLevel}: **${user.eduProgress}/5**`;
 
-    // 4. Lệnh Shop: !shop
-    if (command === 'shop') {
-        return message.reply(
-            `🛒 **CỬA HÀNG VẬT PHẨM**\n` +
-            `1. **Mặt nạ** (mask) - Giá: 150 VNĐ\n` +
-            `2. **Găng tay** (gloves) - Giá: 200 VNĐ\n` +
-            `3. **Bộ phá khóa** (lockpick) - Giá: 300 VNĐ\n` +
-            `4. **Xe máy** (motorbike) - Giá: 500 VNĐ (Cần để làm Shipper)\n\n` +
-            `💡 Dùng lệnh: \`!mua [tên_vật_phẩm]\``
-        );
-    }
+            if (user.eduProgress >= 5) {
+                user.eduProgress = 0;
+                user.eduLevel += 1;
 
-    // 5. Lệnh mua đồ: !mua [item]
-    if (command === 'mua') {
-        const item = args[0]?.toLowerCase();
-        const prices = { mask: 150, gloves: 200, lockpick: 300, motorbike: 500 };
+                if (user.eduLevel > 3) {
+                    const roll = Math.random();
+                    if (roll < 0.05) {
+                        user.university = 'Đại học Bách Khoa';
+                    } else if (roll < 0.17) {
+                        user.university = 'Đại học Ngoại Thương';
+                    } else if (roll < 0.40) {
+                        user.university = 'Đại học Kinh Tế Quốc Dân';
+                    } else if (roll < 0.70) {
+                        user.university = 'Đại học Quốc Gia';
+                    } else {
+                        user.university = 'Cao đẳng Nghề';
+                    }
 
-        if (!prices[item]) {
-            return sendAutoDeleteMessage(message, `❌ Vật phẩm không tồn tại! Các món có sẵn: mask, gloves, lockpick, motorbike.`);
-        }
-
-        const price = prices[item];
-        if (user.balance < price) {
-            return sendAutoDeleteMessage(message, `❌ Bạn không đủ tiền! Cần **${price} VNĐ** để mua ${item}.`);
-        }
-
-        if (user.inventory.includes(item)) {
-            return sendAutoDeleteMessage(message, `⚠️ Bạn đã sở hữu vật phẩm này rồi!`);
-        }
-
-        user.balance -= price;
-        user.inventory.push(item);
-        saveData(users);
-
-        return message.reply(`🛍️ Bạn đã mua thành công **${item}** với giá **${price} VNĐ**!`);
-    }
-
-    // 6. Lệnh đi làm: !dilam [shipper / bacsi / congan / cuop]
-    if (command === 'dilam') {
-        const job = args[0]?.toLowerCase();
-        const now = Date.now();
-        const cooldownTime = 60 * 1000;
-
-        if (now - user.cooldowns.dilam < cooldownTime) {
-            const remaining = Math.ceil((cooldownTime - (now - user.cooldowns.dilam)) / 1000);
-            return sendAutoDeleteMessage(message, `⏱️ Bạn đang mệt, hãy nghỉ ngơi thêm **${remaining} giây** nữa mới được đi làm!`);
-        }
-
-        if (!['shipper', 'bacsi', 'congan', 'cuop'].includes(job)) {
-            return sendAutoDeleteMessage(message, `❌ Nghề nghiệp không hợp lệ! Các nghề có sẵn: \`shipper\`, \`bacsi\`, \`congan\`, \`cuop\`.`);
-        }
-
-        user.cooldowns.dilam = now;
-
-        if (job === 'shipper') {
-            if (!user.inventory.includes('motorbike')) {
-                return sendAutoDeleteMessage(message, `❌ Bạn cần phải mua **Xe máy (motorbike)** trong cửa hàng (\`!shop\`) mới có thể làm Shipper!`);
+                    replyText += `\n\n🎉🎉 **CHÚC MỪNG BẠN ĐÃ TỐT NGHIỆP 3 CẤP HỌC!** 🎉🎉\n` +
+                                 `🎓 Kết quả quay số trúng tuyển trường đại học:\n` +
+                                 `🏛️ Bạn đã đậu vào: **${user.university}**!`;
+                } else {
+                    replyText += `\n🎉 Chúc mừng bạn lên **Cấp học ${user.eduLevel}**! Gõ \`!dihoc\` tiếp tục học.`;
+                }
+            } else {
+                replyText += `\n👉 Gõ tiếp \`!dihoc\` để làm câu tiếp theo.`;
             }
-            if (Math.random() < 0.2) {
-                user.balance = Math.max(0, user.balance - 50);
-                saveData(users);
-                return message.reply(`💥 Đang đi giao hàng thì xe bị tông thủng lốp! Bạn bị phạt viện phí và mất **50 VNĐ**.`);
-            }
-            const salary = Math.floor(Math.random() * 101) + 100;
-            user.balance += salary;
-            saveData(users);
-            return message.reply(`🛵 Bạn hoàn thành chuyến hàng shipper và nhận được **${salary} VNĐ**.`);
-        }
 
-        if (job === 'bacsi') {
-            const salary = Math.floor(Math.random() * 131) + 120;
-            user.balance += salary;
-            saveData(users);
-            return message.reply(`👨‍⚕️ Bạn trực ca tại bệnh viện cứu người và nhận được mức lương **${salary} VNĐ**.`);
-        }
-
-        if (job === 'congan') {
-            const reward = 200;
-            user.balance += reward;
-            saveData(users);
-            return message.reply(`👮‍♂️ Bạn đã tóm gọn thành công một tên tội phạm nguy hiểm và nhận thưởng **${reward} VNĐ**!`);
-        }
-
-        if (job === 'cuop') {
-            if (Math.random() < 0.4) {
-                user.balance = Math.max(0, user.balance - 100);
-                saveData(users);
-                return message.reply(`🚨 Bạn đi trộm cắp và bị công an bắt quả tang! Bạn bị phạt **100 VNĐ**.`);
-            }
-            const loot = Math.floor(Math.random() * 251) + 150;
-            user.balance += loot;
-            saveData(users);
-            return message.reply(`🦹‍♂️ Bạn đột nhập thành công và vơ vét được chiến lợi phẩm trị giá **${loot} VNĐ**!`);
+            saveData();
+            return message.reply(replyText);
+        } else {
+            user.activeQuestion = null;
+            saveData();
+            return message.reply(`❌ **Sai rồi!** Đáp án đúng là **${correct}**. Gõ \`!dihoc\` để làm bài mới.`);
         }
     }
 
-    // 7. Lệnh Tài Xỉu: !taixiu [tai/xiu] [số_tiền]
+    // 5. Lệnh taixiu
     if (command === 'taixiu') {
-        const choice = args[0]?.toLowerCase();
+        const currentTierInfo = cardTiers[user.tier];
+        if (user.debt >= currentTierInfo.maxLoan && user.debt > 0) {
+            return message.reply(`🚫 **BẠN ĐÃ BỊ TƯỚC QUYỀN CHƠI TÀI XỈU!** Đang nợ kịch trần thẻ **${currentTierInfo.name}**. Hãy trả nợ bằng \`!tranganhang\`!`);
+        }
+
+        const choice = args[0] ? args[0].toLowerCase() : '';
         const betAmount = parseInt(args[1]);
 
         if (!['tai', 'xiu'].includes(choice) || isNaN(betAmount) || betAmount <= 0) {
-            return sendAutoDeleteMessage(message, `❌ Cú pháp không đúng! Sử dụng: \`!taixiu [tai/xiu] [số_tiền]\` (Ví dụ: \`!taixiu tai 50\`).`);
+            return message.reply('❌ Cú pháp: `!taixiu tai <số tiền>` hoặc `!taixiu xiu <số tiền>`');
         }
 
         if (user.balance < betAmount) {
-            return sendAutoDeleteMessage(message, `❌ Bạn không đủ **${betAmount} VNĐ** để đặt cược!`);
+            return message.reply(`❌ Không đủ tiền mặt! Số dư: **${user.balance.toLocaleString()} vnđ**.`);
         }
 
-        const d1 = Math.floor(Math.random() * 6) + 1;
-        const d2 = Math.floor(Math.random() * 6) + 1;
-        const d3 = Math.floor(Math.random() * 6) + 1;
-        const total = d1 + d2 + d3;
+        user.balance -= betAmount;
+
+        const dice1 = Math.floor(Math.random() * 6) + 1;
+        const dice2 = Math.floor(Math.random() * 6) + 1;
+        const dice3 = Math.floor(Math.random() * 6) + 1;
+        const total = dice1 + dice2 + dice3;
         const result = total >= 11 ? 'tai' : 'xiu';
 
+        let replyMsg = `🎲 Xúc xắc: **${dice1} - ${dice2} - ${dice3}** (Tổng: **${total}** -> **${result.toUpperCase()}**)\n`;
+
         if (choice === result) {
-            user.balance += betAmount;
-            saveData(users);
-            return message.reply(`🎲 Kết quả: **${d1} - ${d2} - ${d3}** (Tổng: **${total}** - **${result.toUpperCase()}**).\n🎉 Chúc mừng bạn đã thắng và nhận được **${betAmount} VNĐ**! Số dư mới: **${user.balance} VNĐ**.`);
+            const winAmount = betAmount * 2;
+            user.balance += winAmount;
+            replyMsg += `🎉 Chúc mừng bạn **THẮNG** nhận **${winAmount.toLocaleString()} vnđ**!`;
         } else {
-            user.balance -= betAmount;
-            saveData(users);
-            return message.reply(`🎲 Kết quả: **${d1} - ${d2} - ${d3}** (Tổng: **${total}** - **${result.toUpperCase()}**).\n😢 Rất tiếc, bạn đã thua **${betAmount} VNĐ**! Số dư mới: **${user.balance} VNĐ**.`);
+            replyMsg += `😢 Rất tiếc, bạn đã **THUA** ván này.`;
+        }
+
+        saveData();
+        replyMsg += `\n💰 Số dư: **${user.balance.toLocaleString()} vnđ**`;
+        return message.reply(replyMsg);
+    }
+
+    // 6. Lệnh hoso
+    if (command === 'hoso') {
+        let targetUser = message.mentions.users.first() || message.author;
+        let targetId = targetUser.id;
+
+        if (!usersData[targetId]) {
+            return message.reply(`⚠️ Người dùng ${targetUser.username} chưa đăng ký tài khoản.`);
+        }
+
+        const targetData = usersData[targetId];
+        const tierInfo = cardTiers[targetData.tier];
+        
+        let eduStatus = `Cấp ${targetData.eduLevel} (Tiến độ: ${targetData.eduProgress}/5)`;
+        if (targetData.eduLevel > 3) {
+            eduStatus = `Tốt nghiệp (${targetData.university})`;
+        }
+
+        return message.reply(
+            `📊 **HỒ SƠ NGƯỜI CHƠI: ${targetData.username}** 📊\n` +
+            `• Học vấn: **${eduStatus}**\n` +
+            `• Số dư tiền mặt: **${targetData.balance.toLocaleString()} vnđ**\n` +
+            `• Cấp thẻ ngân hàng: **${tierInfo.name} (Cấp ${targetData.tier})**\n` +
+            `• Tiền đang nợ: **${targetData.debt.toLocaleString()}/${tierInfo.maxLoan.toLocaleString()} vnđ**`
+        );
+    }
+
+    // 7. Lệnh vaynganhang
+    if (command === 'vaynganhang') {
+        const loanAmount = parseInt(args[0]);
+        if (isNaN(loanAmount) || loanAmount <= 0) return message.reply('❌ Nhập số tiền vay hợp lệ!');
+
+        const tierInfo = cardTiers[user.tier];
+        if (user.debt + loanAmount > tierInfo.maxLoan) {
+            return message.reply(`❌ Vượt hạn mức thẻ! Tối đa vay thêm: **${(tierInfo.maxLoan - user.debt).toLocaleString()} vnđ**.`);
+        }
+
+        user.debt += loanAmount;
+        user.balance += loanAmount;
+        saveData();
+        return message.reply(`✅ Vay thành công **${loanAmount.toLocaleString()} vnđ**! Tổng nợ: **${user.debt}/${tierInfo.maxLoan} vnđ**`);
+    }
+
+    // 8. Lệnh tranganhang
+    if (command === 'tranganhang') {
+        const payAmount = parseInt(args[0]);
+        if (isNaN(payAmount) || payAmount <= 0) return message.reply('❌ Nhập số tiền trả hợp lệ!');
+        if (user.debt <= 0) return message.reply('🎉 Bạn không nợ ngân hàng!');
+        if (user.balance < payAmount) return message.reply('❌ Không đủ tiền mặt để trả!');
+
+        const actualPay = Math.min(payAmount, user.debt);
+        user.balance -= actualPay;
+        user.debt -= actualPay;
+        const tierInfo = cardTiers[user.tier];
+        saveData();
+        
+        let msg = `✅ Đã trả **${actualPay.toLocaleString()} vnđ** tiền nợ. Nợ còn: **${user.debt} vnđ**`;
+        if (user.debt < tierInfo.maxLoan) msg += `\n🔓 Khôi phục quyền chơi Tài Xỉu!`;
+        return message.reply(msg);
+    }
+
+    // 9. Lệnh nangcapthenganhang
+    if (command === 'nangcapthenganhang') {
+        if (user.tier >= 4) return message.reply('🏆 Thẻ đã đạt cấp tối đa (Infinite)!');
+        const nextTier = user.tier + 1;
+        const nextTierInfo = cardTiers[nextTier];
+
+        if (user.balance < nextTierInfo.upgradeCost) {
+            return message.reply(`❌ Cần **${nextTierInfo.upgradeCost.toLocaleString()} vnđ** để lên ${nextTierInfo.name}.`);
+        }
+
+        user.balance -= nextTierInfo.upgradeCost;
+        user.tier = nextTier;
+        saveData();
+        return message.reply(`🎉 Nâng cấp thành công lên **${nextTierInfo.name}**! Hạn mức mới: **${nextTierInfo.maxLoan} vnđ**.`);
+    }
+
+    // 10. Lệnh bank
+    if (command === 'bank') {
+        const targetUser = message.mentions.users.first();
+        const transferAmount = parseInt(args[1]);
+
+        if (!targetUser || !usersData[targetUser.id] || isNaN(transferAmount) || transferAmount <= 0) {
+            return message.reply('❌ Cú pháp: `!bank @user <số tiền>`');
+        }
+        if (targetUser.id === userId) return message.reply('❌ Không thể chuyển cho chính mình!');
+        if (user.balance < transferAmount) return message.reply('❌ Không đủ số dư để chuyển!');
+
+        user.balance -= transferAmount;
+        usersData[targetUser.id].balance += transferAmount;
+        saveData();
+        return message.reply(`✅ Đã chuyển **${transferAmount.toLocaleString()} vnđ** cho **${targetUser.username}**!`);
+    }
+
+    // 11. Lệnh dilam
+    if (command === 'dilam') {
+        const job = args[0] ? args[0].toLowerCase() : '';
+        if (!['anxin', 'ancuop'].includes(job)) {
+            return message.reply('❌ Chọn nghề: `!dilam anxin` hoặc `!dilam ancuop`');
+        }
+
+        let bonusMultiplier = 1.0;
+        let schoolInfoText = '';
+
+        if (user.university === 'Đại học Bách Khoa') {
+            bonusMultiplier = 1.15;
+            schoolInfoText = ' *(+15% lương - ĐH Bách Khoa)*';
+        } else if (user.university === 'Đại học Ngoại Thương') {
+            bonusMultiplier = 1.10;
+            schoolInfoText = ' *(+10% lương - ĐH Ngoại Thương)*';
+        } else if (user.university === 'Đại học Kinh Tế Quốc Dân') {
+            bonusMultiplier = 1.05;
+            schoolInfoText = ' *(+5% lương - ĐH KTQD)*';
+        } else if (user.university === 'Cao đẳng Nghề') {
+            bonusMultiplier = 0.95;
+            schoolInfoText = ' *(-5% lương - Cao đẳng Nghề)*';
+        }
+
+        if (job === 'anxin') {
+            let baseEarned = Math.floor(Math.random() * 21) + 10;
+            let earned = Math.floor(baseEarned * bonusMultiplier);
+            user.balance += earned;
+            saveData();
+            return message.reply(`🥣 Bạn đi ăn xin và kiếm được **${earned} vnđ**${schoolInfoText}.`);
+        }
+
+        if (job === 'ancuop') {
+            let catchRate = 0.5;
+            if (user.university === 'Đại học Bách Khoa') catchRate = 0.2;
+            else if (user.university === 'Đại học Ngoại Thương') catchRate = 0.35;
+            else if (user.university === 'Cao đẳng Nghề') catchRate = 0.6;
+
+            const isCaught = Math.random() < catchRate;
+
+            if (isCaught) {
+                const oneHour = 60 * 60 * 1000;
+                user.jailTime = Date.now() + oneHour;
+                saveData();
+                try {
+                    const member = await message.guild.members.fetch(userId);
+                    await member.timeout(oneHour, 'Đi ăn cướp bị bắt');
+                } catch (err) {}
+                return message.reply(`🚨 **CÔNG AN TÓM GỌN!** Bạn bị bắt vào tù 1 giờ và bị mute!`);
+            } else {
+                let baseLooted = Math.floor(Math.random() * 201) + 100;
+                let looted = Math.floor(baseLooted * bonusMultiplier);
+                user.balance += looted;
+                saveData();
+                return message.reply(`🦹‍♂️ Ăn cướp trót lọt! Kiếm được **${looted.toLocaleString()} vnđ**${schoolInfoText}.`);
+            }
         }
     }
 });
 
-client.login('TOKEN_THAT_CUA_BAN');
-                
+// Đăng nhập bot (giữ nguyên token trực tiếp của bạn vào đây)
+client.login('TOKEN_THAT_CUA_BAN_O_DAY');
+            
