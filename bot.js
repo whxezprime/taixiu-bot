@@ -1,64 +1,58 @@
-const { Client, GatewayIntentBits } = require('discord.js');
 const fs = require('fs');
+const { Client, GatewayIntentBits, Partials, EmbedBuilder } = require('discord.js');
 
 const client = new Client({
     intents: [
         GatewayIntentBits.Guilds,
         GatewayIntentBits.GuildMessages,
         GatewayIntentBits.MessageContent,
-        GatewayIntentBits.GuildMembers
-    ]
+        GatewayIntentBits.GuildMembers,
+    ],
+    partials: [Partials.Channel, Partials.Message, Partials.Reaction]
 });
 
 const DATA_FILE = './users.json';
+const PREFIX = '!';
 
-// Đọc dữ liệu người dùng
+// Hàm đọc dữ liệu người dùng
 function loadData() {
-    try {
-        if (fs.existsSync(DATA_FILE)) {
-            return JSON.parse(fs.readFileSync(DATA_FILE, 'utf8'));
-        }
-    } catch (e) {
-        console.error("Lỗi đọc file dữ liệu:", e);
+    if (!fs.existsSync(DATA_FILE)) {
+        fs.writeFileSync(DATA_FILE, '{}');
     }
-    return {};
+    try {
+        const data = fs.readFileSync(DATA_FILE, 'utf8');
+        return JSON.parse(data);
+    } catch (err) {
+        return {};
+    }
 }
 
-// Lưu dữ liệu người dùng
+// Hàm lưu dữ liệu người dùng
 function saveData(data) {
-    try {
-        fs.writeFileSync(DATA_FILE, JSON.stringify(data, null, 2));
-    } catch (e) {
-        console.error("Lỗi ghi file dữ liệu:", e);
-    }
+    fs.writeFileSync(DATA_FILE, JSON.stringify(data, null, 2));
 }
 
-// Hàm gửi tin nhắn và tự động xóa sau 10 giây
-function sendAutoDeleteMessage(message, content, time = 10000) {
-    message.reply(content).then(sentMessage => {
+// Hàm hỗ trợ tự xóa tin nhắn sau 10 giây
+function sendAutoDeleteMessage(message, content) {
+    message.reply(content).then(sentMsg => {
         setTimeout(() => {
-            sentMessage.delete().catch(() => {});
-        }, time);
-    }).catch(() => {});
+            sentMsg.delete().catch(() => {});
+        }, 10000);
+    });
 }
 
-// Lưu vết vụ cướp gần nhất để Công an bắt
-let activeRobbery = null;
-
-client.once('ready', () => {
+client.on('clientReady', () => {
     console.log(`Bot đã đăng nhập thành công với tên: ${client.user.tag}`);
 });
 
 client.on('messageCreate', async message => {
     if (message.author.bot) return;
 
-    // Tự động bỏ qua prefix (hỗ trợ cả có dấu ! hoặc không)
+    // Tự động xóa các tin nhắn không phải lệnh hoặc tin lỗi sau 10s (tùy chọn)
     let content = message.content.trim();
-    if (content.startsWith('!')) {
-        content = content.slice(1);
-    }
+    if (!content.startsWith(PREFIX)) return;
 
-    const args = content.split(/ +/);
+    const args = content.slice(PREFIX.length).trim().split(/ +/);
     const command = args.shift().toLowerCase();
 
     let users = loadData();
@@ -67,225 +61,178 @@ client.on('messageCreate', async message => {
     if (!users[userId]) {
         users[userId] = {
             balance: 100, // Tiền khởi đầu
-            job: null,
-            inventory: {
-                mask: 0,
-                gloves: false,
-                lockpick: 0,
-                motorbike: false
+            inventory: [],
+            jobs: {
+                policeMisses: 0
             },
-            begData: { count: 0, resetTime: 0 },
-            missedRobberies: 0,
-            jailed: false
+            cooldowns: {
+                anxin: 0,
+                anxinCount: 0,
+                dilam: 0
+            }
         };
     }
     let user = users[userId];
 
-    // --- LỆNH KIỂM TRA SỐ DƯ ---
+    // 1. Lệnh kiểm tra số dư: !sodu hoặc !bal
     if (command === 'sodu' || command === 'bal') {
-        return message.reply(`💰 Số dư tài khoản của bạn: **${user.balance} VNĐ**\n💼 Nghề nghiệp: **${user.job || 'Chưa có'}**`);
+        return message.reply(`💰 Số dư hiện tại của bạn: **${user.balance} VNĐ**`);
     }
 
-    // --- LỆNH ĂN XIN (Tối đa 5 lần/2h, nhận 5-10 VNĐ) ---
+    // 2. Lệnh ăn xin: !anxin (5 lần / 2 tiếng, 5-10 VNĐ)
     if (command === 'anxin') {
         const now = Date.now();
-        const COOLDOWN_TIME = 2 * 60 * 60 * 1000; // 2 giờ
-        const MAX_BEG_USES = 5;
+        const twoHours = 2 * 60 * 60 * 1000;
 
-        if (now > user.begData.resetTime) {
-            user.begData.count = 0;
-            user.begData.resetTime = now + COOLDOWN_TIME;
+        if (now - user.cooldowns.anxin > twoHours) {
+            user.cooldowns.anxin = now;
+            user.cooldowns.anxinCount = 0;
         }
 
-        if (user.begData.count >= MAX_BEG_USES) {
-            const timeLeft = Math.ceil((user.begData.resetTime - now) / 60000);
-            return sendAutoDeleteMessage(message, `乞 Bạn đã ăn xin quá số lần cho phép! Vui lòng đợi thêm **${timeLeft} phút** nữa.`);
+        if (user.cooldowns.anxinCount >= 5) {
+            return sendAutoDeleteMessage(message, `⏳ Bạn đã ăn xin quá 5 lần trong 2 giờ qua. Hãy nghỉ ngơi nhé!`);
         }
 
-        const earned = Math.floor(Math.random() * (10 - 5 + 1)) + 5;
+        user.cooldowns.anxinCount += 1;
+        const earned = Math.floor(Math.random() * 6) + 5; // Từ 5 đến 10 VNĐ
         user.balance += earned;
-        user.begData.count++;
         saveData(users);
 
-        return message.reply(`乞 Bạn đi ăn xin và kiếm được **${earned} VNĐ**! (Đã dùng ${user.begData.count}/${MAX_BEG_USES} lần trong 2h qua).`);
+        return message.reply(`乞 Bạn đi ăn xin và kiếm được **${earned} VNĐ**! (${user.cooldowns.anxinCount}/5 lần trong 2h qua).`);
     }
 
-    // --- CỬA HÀNG (!shop) ---
+    // 3. Lệnh Shop: !shop
     if (command === 'shop') {
         return message.reply(
-            `🛒 **CỬA HÀNG VẬT PHẨM & NGHỀ NGHIỆP**\n` +
-            `1. **Mặt nạ** - Giá: **200 VNĐ** *(Giảm tỉ lệ bị bắt vào tù)*\n` +
-            `2. **Găng tay** - Giá: **300 VNĐ** *(Tăng 10% số tiền cướp được)*\n` +
-            `3. **Bẻ khóa** - Giá: **500 VNĐ/cái** *(Tỉ lệ 30% vượt ngục khi bị bắt)*\n` +
-            `4. **Xe máy** - Giá: **10,000 VNĐ** *(Mở khóa nghề Shipper, tối đa 1 chiếc)*\n\n` +
-            `👉 Dùng lệnh: \`!mua [matna / gangtay / bekhoa / xemay]\``
+            `🛒 **CỬA HÀNG VẬT PHẨM**\n` +
+            `1. **Mặt nạ** (mask) - Giá: 150 VNĐ\n` +
+            `2. **Găng tay** (gloves) - Giá: 200 VNĐ\n` +
+            `3. **Bộ phá khóa** (lockpick) - Giá: 300 VNĐ\n` +
+            `4. **Xe máy** (motorbike) - Giá: 500 VNĐ (Cần để làm Shipper)\n\n` +
+            `💡 Dùng lệnh: \`!mua [tên_vật_phẩm]\``
         );
     }
 
-    // --- MUA ĐỒ (!mua) ---
+    // 4. Lệnh Mua đồ: !mua [item]
     if (command === 'mua') {
         const item = args[0]?.toLowerCase();
-        if (!item) return sendAutoDeleteMessage(message, `⚠️ Vui lòng nhập tên món đồ cần mua! VD: \`!mua matna\``);
+        const prices = { mask: 150, gloves: 200, lockpick: 300, motorbike: 500 };
 
-        if (item === 'matna') {
-            if (user.balance < 200) return sendAutoDeleteMessage(message, `❌ Bạn không đủ 200 VNĐ để mua Mặt nạ!`);
-            user.balance -= 200;
-            user.inventory.mask = (user.inventory.mask || 0) + 1;
-            saveData(users);
-            return message.reply(`✅ Bạn đã mua thành công **Mặt nạ**!`);
+        if (!prices[item]) {
+            return sendAutoDeleteMessage(message, `❌ Vật phẩm không tồn tại! Các món có sẵn: mask, gloves, lockpick, motorbike.`);
         }
-        else if (item === 'gangtay') {
-            if (user.balance < 300) return sendAutoDeleteMessage(message, `❌ Bạn không đủ 300 VNĐ để mua Găng tay!`);
-            user.balance -= 300;
-            user.inventory.gloves = true;
-            saveData(users);
-            return message.reply(`✅ Bạn đã mua thành công **Găng tay**! (Tăng 10% tiền cướp).`);
+
+        const price = prices[item];
+        if (user.balance < price) {
+            return sendAutoDeleteMessage(message, `❌ Bạn không đủ tiền! Cần **${price} VNĐ** để mua ${item}.`);
         }
-        else if (item === 'bekhoa') {
-            if (user.balance < 500) return sendAutoDeleteMessage(message, `❌ Bạn không đủ 500 VNĐ để mua Bẻ khóa!`);
-            user.balance -= 500;
-            user.inventory.lockpick = (user.inventory.lockpick || 0) + 1;
-            saveData(users);
-            return message.reply(`✅ Bạn đã mua thành công **1x Bẻ khóa**!`);
+
+        if (user.inventory.includes(item)) {
+            return sendAutoDeleteMessage(message, `⚠️ Bạn đã sở hữu vật phẩm này rồi!`);
         }
-        else if (item === 'xemay') {
-            if (user.inventory.motorbike) return sendAutoDeleteMessage(message, `❌ Bạn đã sở hữu xe máy rồi, mỗi user chỉ sở hữu được 1 chiếc!`);
-            if (user.balance < 10000) return sendAutoDeleteMessage(message, `❌ Bạn không đủ 10,000 VNĐ để mua Xe máy!`);
-            user.balance -= 10000;
-            user.inventory.motorbike = true;
-            saveData(users);
-            return message.reply(`🏍️ Chúc mừng bạn đã sở hữu **Xe máy**! Giờ đây bạn có thể dùng lệnh \`!dilam shipper\` để làm nghề Shipper.`);
-        } else {
-            return sendAutoDeleteMessage(message, `❌ Vật phẩm không tồn tại trong cửa hàng!`);
-        }
+
+        user.balance -= price;
+        user.inventory.push(item);
+        saveData(users);
+
+        return message.reply(`🛍️ Bạn đã mua thành công **${item}** với giá **${price} VNĐ**!`);
     }
 
-    // --- ĐI LÀM / NHẬN NGHỀ (!dilam [nghề]) ---
+    // 5. Lệnh Đi làm: !dilam [shipper / bacsi / congan / cuop]
     if (command === 'dilam') {
-        const targetJob = args[0]?.toLowerCase();
-        const validJobs = ['shipper', 'bacsi', 'congan', 'cuop'];
+        const job = args[0]?.toLowerCase();
+        const now = Date.now();
+        const cooldownTime = 60 * 1000; // 1 phút cooldown mỗi lần làm việc
 
-        if (!targetJob || !validJobs.includes(targetJob)) {
-            return sendAutoDeleteMessage(message, `⚠️ Vui lòng chọn nghề hợp lệ để làm! Các nghề có sẵn: \`!dilam shipper\`, \`!dilam bacsi\`, \`!dilam congan\`, \`!dilam cuop\``);
+        if (now - user.cooldowns.dilam < cooldownTime) {
+            const remaining = Math.ceil((cooldownTime - (now - user.cooldowns.dilam)) / 1000);
+            return sendAutoDeleteMessage(message, `⏱️ Bạn đang mệt, hãy nghỉ ngơi thêm **${remaining} giây** nữa mới được đi làm!`);
         }
 
-        // Kiểm tra điều kiện riêng cho Shipper
-        if (targetJob === 'shipper' && !user.inventory.motorbike) {
-            return sendAutoDeleteMessage(message, `❌ Bạn chưa có xe máy! Hãy ra \`!shop\` mua xe máy trước khi nhận nghề Shipper.`);
+        if (!['shipper', 'bacsi', 'congan', 'cuop'].includes(job)) {
+            return sendAutoDeleteMessage(message, `❌ Nghề nghiệp không hợp lệ! Các nghề có sẵn: \`shipper\`, \`bacsi\`, \`congan\`, \`cuop\`.`);
         }
 
-        user.job = targetJob;
-        saveData(users);
+        user.cooldowns.dilam = now;
 
-        if (targetJob === 'shipper') {
-            // Thực hiện công việc Shipper ngay khi gõ !dilam shipper
-            const isAccident = Math.random() < 0.10; // 10% rủi ro tai nạn
-            if (isAccident) {
-                const fine = 50;
-                user.balance = Math.max(0, user.balance - fine);
-                saveData(users);
-                return message.reply(`💥 Ôi không! Trên đường giao hàng Shipper, bạn không may gặp tai nạn giao thông nhẹ và mất **${fine} VNĐ** viện phí.`);
+        // Nghề Shipper: Cần xe máy, lương 100-200 VNĐ, rủi ro tai nạn mất 50 VNĐ
+        if (job === 'shipper') {
+            if (!user.inventory.includes('motorbike')) {
+                return sendAutoDeleteMessage(message, `❌ Bạn cần phải mua **Xe máy (motorbike)** trong cửa hàng (\`!shop\`) mới có thể làm Shipper!`);
             }
-            const salary = Math.floor(Math.random() * (200 - 100 + 1)) + 100;
+            if (Math.random() < 0.2) { // 20% tai nạn
+                user.balance = Math.max(0, user.balance - 50);
+                saveData(users);
+                return message.reply(`💥 Đang đi giao hàng thì xe bị tông thủng lốp! Bạn bị phạt viện phí và mất **50 VNĐ**.`);
+            }
+            const salary = Math.floor(Math.random() * 101) + 100; // 100 - 200 VNĐ
             user.balance += salary;
             saveData(users);
-            return message.reply(`📦 Bạn đã nhận nghề **Shipper** và hoàn thành chuyến giao hàng an toàn, nhận được **${salary} VNĐ** tiền lương ổn định!`);
+            return message.reply(`🛵 Bạn hoàn thành chuyến hàng shipper và nhận được **${salary} VNĐ**.`);
         }
-        else if (targetJob === 'bacsi') {
-            const salary = Math.floor(Math.random() * (500 - 300 + 1)) + 300; // Lương rất cao
+
+        // Nghề Bác sĩ: Lương ổn định 120-250 VNĐ
+        if (job === 'bacsi') {
+            const salary = Math.floor(Math.random() * 131) + 120;
             user.balance += salary;
             saveData(users);
-            return message.reply(`🩺 Bạn đã nhận nghề **Bác sĩ** và hoàn thành ca trực cứu người, nhận được **${salary} VNĐ** lương cao (Rủi ro: 0%)!`);
-        }
-        else if (targetJob === 'congan') {
-            return message.reply(`👮‍♂️ Bạn đã chính thức gia nhập lực lượng **Công an**! Hãy chú ý theo dõi tội phạm và dùng lệnh \`!bat [@user]\` để bắt trộm.`);
-        }
-        else if (targetJob === 'cuop') {
-            return message.reply(`🦹‍♂️ Bạn đã chọn con đường phạm tội (**Cướp giật**)!`);
-        }
-    }
-
-    // --- LỆNH CƯỚP (!cuop) ---
-    if (command === 'cuop') {
-        if (user.job !== 'cuop') {
-            return sendAutoDeleteMessage(message, `❌ Bạn phải dùng lệnh \`!dilam cuop\` để nhận nghề cướp trước khi đi hành động!`);
+            return message.reply(`👨‍⚕️ Bạn trực ca tại bệnh viện cứu người và nhận được mức lương **${salary} VNĐ**.`);
         }
 
-        const targetUser = message.mentions.users.first();
-        if (!targetUser || targetUser.id === userId) {
-            return sendAutoDeleteMessage(message, `⚠️ Vui lòng tag một người chơi khác để cướp! VD: \`!cuop @username\``);
-        }
-
-        let targetData = users[targetUser.id];
-        if (!targetData || targetData.balance <= 0) {
-            return sendAutoDeleteMessage(message, `❌ Người này không có xu nào để bạn cướp cả!`);
-        }
-
-        // Tỉ lệ cướp thành công (có thể ảnh hưởng bởi mặt nạ/găng tay)
-        let baseSteal = Math.floor(Math.random() * 150) + 50;
-        if (user.inventory.gloves) {
-            baseSteal = Math.floor(baseSteal * 1.1); // Tăng 10% tiền cướp được
-        }
-
-        targetData.balance = Math.max(0, targetData.balance - baseSteal);
-        user.balance += baseSteal;
-        saveData(users);
-
-        message.reply(`🦹‍♂️ Bạn đã đột nhập và cướp thành công **${baseSteal} VNĐ** từ <@${targetUser.id}>!`);
-
-        // Kích hoạt báo động cho Công an
-        let policeIds = Object.keys(users).filter(id => users[id].job === 'congan');
-        if (policeIds.length > 0) {
-            activeRobbery = { thiefId: userId, caught: false };
-            message.channel.send(`🚨 **BÁO ĐỘNG!** Kẻ gian <@${userId}> vừa thực hiện một vụ cướp! Các đồng chí Công an (${policeIds.map(id => `<@${id}>`).join(', ')}) hãy dùng lệnh \`!bat <@${userId}>\` ngay lập tức!`);
-
-            // Sau 30 giây nếu công an không bắt -> phạt công an
-            setTimeout(() => {
-                let currentUsers = loadData();
-                if (activeRobbery && activeRobbery.thiefId === userId && !activeRobbery.caught) {
-                    policeIds.forEach(pId => {
-                        let cop = currentUsers[pId];
-                        if (cop && cop.job === 'congan') {
-                            cop.balance = Math.max(0, cop.balance - 100); // Trừ 100 VNĐ
-                            cop.missedRobberies = (cop.missedRobberies || 0) + 1;
-
-                            let notice = `⚠️ Công an <@${pId}> đã để tên trộm tẩu thoát và bị phạt **100 VNĐ**! (Bỏ sót: ${cop.missedRobberies}/10 lần).`;
-
-                            if (cop.missedRobberies >= 10) {
-                                cop.job = null; // Tước việc
-                                cop.missedRobberies = 0;
-                                notice += `\n❌ Do bỏ sót quá 10 lần, bạn đã **bị tước quyền công an**!`;
-                            }
-                            message.channel.send(notice);
-                        }
-                    });
-                    saveData(currentUsers);
-                }
-            }, 30000);
-        }
-        return;
-    }
-
-    // --- CÔNG AN BẮT TỘI PHẠM (!bat) ---
-    if (command === 'bat') {
-        if (user.job !== 'congan') {
-            return sendAutoDeleteMessage(message, `❌ Bạn không phải là Công an nên không có quyền bắt người!`);
-        }
-
-        const targetUser = message.mentions.users.first();
-        if (!targetUser) return sendAutoDeleteMessage(message, `⚠️ Vui lòng tag tên trộm cần bắt! VD: \`!bat @username\``);
-
-        if (activeRobbery && activeRobbery.thiefId === targetUser.id && !activeRobbery.caught) {
-            activeRobbery.caught = true;
+        // Nghề Công an: Bắt cướp
+        if (job === 'congan') {
+            // Tìm ngẫu nhiên xem có bắt được tên cướp nào đang hoạt động không
             const reward = 200;
             user.balance += reward;
             saveData(users);
-            return message.reply(`👮‍♂️ Bạn đã tóm gọn tên tội phạm <@${targetUser.id}> kịp thời và nhận được **${reward} VNĐ** tiền thưởng xuất sắc!`);
+            return message.reply(`👮‍♂️ Bạn đã tóm gọn thành công một tên tội phạm nguy hiểm và nhận thưởng **${reward} VNĐ**!`);
+        }
+
+        // Nghề Cướp: Kiếm nhiều tiền nhưng rủi ro cao
+        if (job === 'cuop') {
+            if (Math.random() < 0.4) { // 40% bị công an tóm
+                user.balance = Math.max(0, user.balance - 100);
+                saveData(users);
+                return message.reply(`🚨 Bạn đi trộm cắp và bị công an bắt quả tang! Bạn bị phạt **100 VNĐ**.`);
+            }
+            const loot = Math.floor(Math.random() * 251) + 150; // 150 - 400 VNĐ
+            user.balance += loot;
+            saveData(users);
+            return message.reply(`🦹‍♂️ Bạn đột nhập thành công và vơ vét được chiến lợi phẩm trị giá **${loot} VNĐ**!`);
+        }
+    }
+
+    // 6. Lệnh Tài Xỉu: !taixiu [tai/xiu] [số_tiền]
+    if (command === 'taixiu') {
+        const choice = args[0]?.toLowerCase();
+        const betAmount = parseInt(args[1]);
+
+        if (!['tai', 'xiu'].includes(choice) || isNaN(betAmount) || betAmount <= 0) {
+            return sendAutoDeleteMessage(message, `❌ Cú pháp không đúng! Sử dụng: \`!taixiu [tai/xiu] [số_tiền]\` (Ví dụ: \`!taixiu tai 50\`).`);
+        }
+
+        if (user.balance < betAmount) {
+            return sendAutoDeleteManager ? null : sendAutoDeleteMessage(message, `❌ Bạn không đủ **${betAmount} VNĐ** để đặt cược!`);
+        }
+
+        // Tung 3 con xúc sắc (mỗi con từ 1 đến 6)
+        const d1 = Math.floor(Math.random() * 6) + 1;
+        const d2 = Math.floor(Math.random() * 6) + 1;
+        const d3 = Math.floor(Math.random() * 6) + 1;
+        const total = d1 + d2 + d3;
+        const result = total >= 11 ? 'tai' : 'xiu';
+
+        if (choice === result) {
+            user.balance += betAmount;
+            saveData(users);
+            return message.reply(`🎲 Kết quả: **${d1} - ${d2} - ${d3}** (Tổng: **${total}** - **${result.toUpperCase()}**).\n🎉 Chúc mừng bạn đã thắng và nhận được **${betAmount} VNĐ**! Số dư mới: **${user.balance} VNĐ**.`);
         } else {
-            return sendAutoDeleteMessage(message, `❌ Người này không phạm tội gần đây hoặc đã chạy trốn mất tăm!`);
+            user.balance -= betAmount;
+            saveData(users);
+            return message.reply(`🎲 Kết quả: **${d1} - ${d2} - ${d3}** (Tổng: **${total}** - **${result.toUpperCase()}**).\n😢 Rất tiếc, bạn đã thua **${betAmount} VNĐ**! Số dư mới: **${user.balance} VNĐ**.`);
         }
     }
 });
 
-// Đăng nhập bot trực tiếp bằng token của bạn
+// Thay token chuẩn của bạn vào đây (giữ nguyên cặp nháy đơn)
 client.login('TOKEN_THAT_CUA_BAN');
