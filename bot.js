@@ -12,7 +12,7 @@ const fs = require('fs');
 const path = require('path');
 const {
   Client, GatewayIntentBits, EmbedBuilder, ActionRowBuilder, ButtonBuilder,
-  ButtonStyle, PermissionsBitField, MessageFlags,
+  ButtonStyle, PermissionsBitField, MessageFlags, AttachmentBuilder,
 } = require('discord.js');
 
 const TOKEN = process.env.DISCORD_TOKEN;
@@ -540,6 +540,10 @@ lenh.set('helptx', (m) => {
         value: '`!baucua <số tiền|all>` — cược rồi bấm nút chọn con',
       },
       {
+        name: '🌱 Game trồng cây',
+        value: '`!game2d` — mở khu vườn 2D: trồng cây, tưới nước, thu hoạch, bán trái cây (dùng chung tiền với bot)',
+      },
+      {
         name: '🃏 Bài 3 cây (2–4 người)',
         value:
           '`!taoban` — tạo bàn • `!vaoban` — vào bàn • `!roiban` — rời bàn\n' +
@@ -764,6 +768,654 @@ async function xuLyAdmin(m, cmd, args) {
     }
   }
 }
+
+// ===================== GAME 2D: TRỒNG CÂY (!game2d) =====================
+// Ý tưởng: Grow a Garden. Map pixel được vẽ bằng code (không cần file ảnh)
+// rồi gửi dưới dạng PNG. Tiền trong game = tiền của user trong bot (u.balance).
+const zlib = require('zlib');
+
+// ---------- Cấu hình game ----------
+// tgLon: giây để cây lớn lần đầu • tgLai: giây để mọc lại quả (cây hái nhiều lần)
+// toiDa: số lần hái tối đa trước khi cây tàn (chống lạm phát) • banGia: giá bán 1 trái
+const SEEDS = {
+  carrot:     { ten: 'Cà rốt',  e: '🥕', gia: 10, banGia: 16, tgLon: 60,  tgLai: 0,   toiDa: 1, mota: 'hái 1 lần' },
+  tomato:     { ten: 'Cà chua', e: '🍅', gia: 15, banGia: 8,  tgLon: 90,  tgLai: 60,  toiDa: 5, mota: 'hái nhiều lần' },
+  watermelon: { ten: 'Dưa hấu', e: '🍉', gia: 40, banGia: 26, tgLon: 180, tgLai: 120, toiDa: 4, mota: 'hái nhiều lần' },
+};
+const TOOLS = {
+  binh: { ten: 'Bình tưới nước', e: '💧', gia: 20, mota: 'dùng 1 lần, giảm 50% thời gian lớn còn lại' },
+  xeng: { ten: 'Xẻng',           e: '⛏️', gia: 10, mota: 'dùng 1 lần, xúc cây để chuyển sang vườn khác' },
+};
+// Hiệu ứng ngẫu nhiên khi quả mọc
+const MUT = {
+  vang: { ten: 'Vàng',     e: '✨', nhan: 1.5, tl: 0.30 },
+  cv:   { ten: 'Cầu vồng', e: '🌈', nhan: 2.5, tl: 0.10 },
+};
+const GAME_IDLE = 5 * 60 * 1000; // không bấm gì 5 phút thì đóng phiên
+
+function rollMut() {
+  const r = Math.random();
+  if (r < MUT.cv.tl) return 'cv';
+  if (r < MUT.cv.tl + MUT.vang.tl) return 'vang';
+  return null;
+}
+const giaTri = (type, mut) => Math.round(SEEDS[type].banGia * (mut ? MUT[mut].nhan : 1));
+
+// ---------- Bản đồ ----------
+// T cây • R mái nhà • W tường • D cửa • p đường • . cỏ • ~ nước • F ô đất trồng
+// f/s/t = NPC cửa hàng trái cây / hạt giống / đồ dùng
+const MAP = [
+  'TTTTTTTTTTTTTT',
+  'TRRR.RRR.RRR.T',
+  'TWDW.WDW.WDW.T',
+  'T.f...s...t..T',
+  'TppppppppppppT',
+  'T............T',
+  'T..FF.~~.FF..T',
+  'T..FF.~~.FF..T',
+  'TppppppppppppT',
+  'TTTTTTTTTTTTTT',
+];
+const COLS = MAP[0].length;
+const ROWS = MAP.length;
+const PLOT_POS = [];  // idx -> {x,y}
+const PLOT_AT = {};   // "x,y" -> idx
+MAP.forEach((row, y) => [...row].forEach((ch, x) => {
+  if (ch === 'F') { PLOT_AT[`${x},${y}`] = PLOT_POS.length; PLOT_POS.push({ x, y }); }
+}));
+const tileAt = (x, y) => (x < 0 || y < 0 || x >= COLS || y >= ROWS ? 'T' : MAP[y][x]);
+const DI_DUOC = new Set(['.', 'p']);
+const DIR = { up: [0, -1], down: [0, 1], left: [-1, 0], right: [1, 0] };
+
+// ---------- Dữ liệu vườn của từng user ----------
+function getFarm(u) {
+  if (!u.farm) u.farm = {};
+  const f = u.farm;
+  if (!f.pos) f.pos = { x: 5, y: 4 };
+  if (!Array.isArray(f.plots) || f.plots.length !== PLOT_POS.length) {
+    const cu = f.plots || [];
+    f.plots = PLOT_POS.map((_, i) => cu[i] || null);
+  }
+  f.seeds = Object.assign({ carrot: 0, tomato: 0, watermelon: 0 }, f.seeds || {});
+  if (!f.fruits) f.fruits = {};
+  if (f.binh === undefined) f.binh = 0;
+  if (f.xeng === undefined) f.xeng = 0;
+  if (f.carry === undefined) f.carry = null; // cây đang cầm (sau khi xúc)
+  return f;
+}
+
+// ---------- Vẽ pixel ----------
+const TS = 16; // kích thước 1 ô (pixel gốc)
+const SC = 3;  // phóng to khi xuất ảnh
+const mkCanvas = (w, h) => ({ w, h, d: new Uint8Array(w * h * 3) });
+function px(cv, x, y, c) {
+  if (x < 0 || y < 0 || x >= cv.w || y >= cv.h) return;
+  const i = (y * cv.w + x) * 3;
+  cv.d[i] = (c >> 16) & 255; cv.d[i + 1] = (c >> 8) & 255; cv.d[i + 2] = c & 255;
+}
+function rect(cv, x, y, w, h, c) {
+  for (let j = 0; j < h; j++) for (let i = 0; i < w; i++) px(cv, x + i, y + j, c);
+}
+const toi = (c, f) =>
+  (Math.floor(((c >> 16) & 255) * f) << 16) | (Math.floor(((c >> 8) & 255) * f) << 8) | Math.floor((c & 255) * f);
+function hash(x, y) {
+  let h = (Math.imul(x + 1, 73856093) ^ Math.imul(y + 1, 19349663)) >>> 0;
+  h = (h ^ (h >>> 13)) >>> 0;
+  return h;
+}
+
+// Ghi PNG (RGB 8-bit) bằng zlib có sẵn, phóng to sc lần kiểu pixel art
+const CRC_T = (() => {
+  const t = new Int32Array(256);
+  for (let n = 0; n < 256; n++) {
+    let c = n;
+    for (let k = 0; k < 8; k++) c = c & 1 ? 0xedb88320 ^ (c >>> 1) : c >>> 1;
+    t[n] = c;
+  }
+  return t;
+})();
+function crc32(buf) {
+  let c = -1;
+  for (let i = 0; i < buf.length; i++) c = CRC_T[(c ^ buf[i]) & 255] ^ (c >>> 8);
+  return (c ^ -1) >>> 0;
+}
+function pngChunk(type, data) {
+  const len = Buffer.alloc(4); len.writeUInt32BE(data.length);
+  const td = Buffer.concat([Buffer.from(type, 'ascii'), data]);
+  const crc = Buffer.alloc(4); crc.writeUInt32BE(crc32(td));
+  return Buffer.concat([len, td, crc]);
+}
+function ghiPNG(cv, sc) {
+  const W = cv.w * sc, H = cv.h * sc;
+  const raw = Buffer.alloc((W * 3 + 1) * H);
+  let o = 0;
+  for (let y = 0; y < H; y++) {
+    raw[o++] = 0; // filter none
+    const sy = Math.floor(y / sc);
+    for (let x = 0; x < W; x++) {
+      const si = (sy * cv.w + Math.floor(x / sc)) * 3;
+      raw[o++] = cv.d[si]; raw[o++] = cv.d[si + 1]; raw[o++] = cv.d[si + 2];
+    }
+  }
+  const ihdr = Buffer.alloc(13);
+  ihdr.writeUInt32BE(W, 0); ihdr.writeUInt32BE(H, 4);
+  ihdr[8] = 8; ihdr[9] = 2; // 8-bit, truecolor
+  return Buffer.concat([
+    Buffer.from([137, 80, 78, 71, 13, 10, 26, 10]),
+    pngChunk('IHDR', ihdr),
+    pngChunk('IDAT', zlib.deflateSync(raw, { level: 3 })),
+    pngChunk('IEND', Buffer.alloc(0)),
+  ]);
+}
+
+// ----- các loại ô -----
+function veCo(cv, ox, oy, tx, ty) {
+  rect(cv, ox, oy, TS, TS, 0x62c04e);
+  for (let i = 0; i < 6; i++) {
+    const h = hash(tx * 7 + i, ty * 13 + i * 3);
+    px(cv, ox + (h % 14) + 1, oy + ((h >>> 4) % 14) + 1, (h >>> 9) & 1 ? 0x4fa83c : 0x7fd466);
+  }
+}
+function veDuong(cv, ox, oy, tx, ty) {
+  rect(cv, ox, oy, TS, TS, 0xdcc784);
+  for (let i = 0; i < 5; i++) {
+    const h = hash(tx * 5 + i, ty * 11 + i * 7);
+    px(cv, ox + (h % 14) + 1, oy + ((h >>> 4) % 14) + 1, 0xc9b06c);
+  }
+}
+function veCay(cv, ox, oy, tx, ty) {
+  veCo(cv, ox, oy, tx, ty);
+  rect(cv, ox + 7, oy + 10, 2, 5, 0x6b4423);
+  rect(cv, ox + 3, oy + 2, 10, 3, 0x2f8f3a);
+  rect(cv, ox + 2, oy + 4, 12, 5, 0x2f8f3a);
+  rect(cv, ox + 4, oy + 9, 8, 2, 0x277a31);
+  rect(cv, ox + 4, oy + 3, 3, 2, 0x45b04f);
+  rect(cv, ox + 9, oy + 5, 3, 2, 0x45b04f);
+}
+function veNuoc(cv, ox, oy, tx, ty) {
+  rect(cv, ox, oy, TS, TS, 0x3b82d6);
+  for (let i = 0; i < 4; i++) {
+    const h = hash(tx * 3 + i, ty * 9 + i * 5);
+    rect(cv, ox + (h % 11) + 1, oy + ((h >>> 4) % 14) + 1, 3, 1, 0x7dbcf2);
+  }
+}
+function veMai(cv, ox, oy, mau) {
+  rect(cv, ox, oy, TS, TS, mau);
+  for (let y = 3; y < TS; y += 4) rect(cv, ox, oy + y, TS, 1, toi(mau, 0.72));
+  rect(cv, ox, oy, TS, 1, toi(mau, 0.9));
+}
+function veTuong(cv, ox, oy) {
+  rect(cv, ox, oy, TS, TS, 0xeadbb3);
+  for (let y = 3; y < TS; y += 4) rect(cv, ox, oy + y, TS, 1, 0xd2c08f);
+}
+function veCua(cv, ox, oy) {
+  veTuong(cv, ox, oy);
+  rect(cv, ox + 3, oy + 1, 10, 15, 0x6b3f1d);
+  rect(cv, ox + 4, oy + 2, 8, 14, 0x8d5a2c);
+  rect(cv, ox + 7, oy + 2, 2, 14, 0x74461f);
+  px(cv, ox + 10, oy + 9, 0xffd54f);
+}
+function veNPC(cv, ox, oy, tx, ty, ao) {
+  veCo(cv, ox, oy, tx, ty);
+  rect(cv, ox + 4, oy + 14, 8, 2, 0x4a9a3a);
+  rect(cv, ox + 5, oy + 12, 2, 3, 0x2d2d5a);
+  rect(cv, ox + 9, oy + 12, 2, 3, 0x2d2d5a);
+  rect(cv, ox + 4, oy + 7, 8, 6, ao);
+  rect(cv, ox + 6, oy + 9, 4, 4, 0xffffff);
+  rect(cv, ox + 3, oy + 8, 1, 4, 0xf2c9a0);
+  rect(cv, ox + 12, oy + 8, 1, 4, 0xf2c9a0);
+  rect(cv, ox + 5, oy + 2, 6, 6, 0xf2c9a0);
+  rect(cv, ox + 4, oy + 1, 8, 3, toi(ao, 0.7)); // mũ
+  px(cv, ox + 6, oy + 5, 0x222222);
+  px(cv, ox + 9, oy + 5, 0x222222);
+  px(cv, ox + 7, oy + 7, 0xc0756a);
+  px(cv, ox + 8, oy + 7, 0xc0756a);
+}
+
+// Chữ số 3x5 để đánh số ô đất
+const FONT = {
+  1: ['010', '110', '010', '010', '111'], 2: ['111', '001', '111', '100', '111'],
+  3: ['111', '001', '111', '001', '111'], 4: ['101', '101', '111', '001', '001'],
+  5: ['111', '100', '111', '001', '111'], 6: ['111', '100', '111', '101', '111'],
+  7: ['111', '001', '010', '010', '010'], 8: ['111', '101', '111', '101', '111'],
+};
+function veSo(cv, x, y, d, c) {
+  const g = FONT[d];
+  if (!g) return;
+  for (let r = 0; r < 5; r++) for (let k = 0; k < 3; k++) if (g[r][k] === '1') px(cv, x + k, y + r, c);
+}
+function veDat(cv, ox, oy, idx) {
+  rect(cv, ox, oy, TS, TS, 0x7b4a2b);
+  for (let y = 4; y < TS - 1; y += 4) rect(cv, ox + 1, oy + y + 2, 14, 1, 0x5f3a21);
+  rect(cv, ox, oy, TS, 1, 0x94623a); rect(cv, ox, oy + TS - 1, TS, 1, 0x5a3720);
+  rect(cv, ox, oy, 1, TS, 0x94623a); rect(cv, ox + TS - 1, oy, 1, TS, 0x5a3720);
+  veSo(cv, ox + 2, oy + 2, idx + 1, 0xf6e2b5);
+}
+
+// ----- cây trồng -----
+const RB = [0xff1744, 0xff9100, 0xffea00, 0x00e676, 0x2979ff, 0xd500f9];
+const spark = (cv, x, y, c) => { px(cv, x, y, c); px(cv, x - 1, y, c); px(cv, x + 1, y, c); px(cv, x, y - 1, c); px(cv, x, y + 1, c); };
+function hieuUng(cv, ox, oy, mut) {
+  if (mut === 'vang') {
+    for (let i = 0; i < TS; i += 2) {
+      px(cv, ox + i, oy, 0xffd54f); px(cv, ox + i, oy + TS - 1, 0xffd54f);
+      px(cv, ox, oy + i, 0xffd54f); px(cv, ox + TS - 1, oy + i, 0xffd54f);
+    }
+    spark(cv, ox + 3, oy + 4, 0xfff59d); spark(cv, ox + 12, oy + 11, 0xfff59d);
+  } else {
+    for (let i = 0; i < TS; i++) {
+      px(cv, ox + i, oy, RB[i % 6]); px(cv, ox + i, oy + TS - 1, RB[(i + 3) % 6]);
+      px(cv, ox, oy + i, RB[(i + 1) % 6]); px(cv, ox + TS - 1, oy + i, RB[(i + 4) % 6]);
+    }
+    spark(cv, ox + 3, oy + 4, 0xffffff); spark(cv, ox + 12, oy + 11, 0xffffff);
+  }
+}
+function vePlant(cv, ox, oy, p, now) {
+  const chin = now >= p.readyAt;
+  const prog = Math.min(1, (now - p.cycleStart) / Math.max(1, p.readyAt - p.cycleStart));
+  if (!chin) {
+    if (p.harvests === 0 && prog < 0.5) { // mầm
+      rect(cv, ox + 7, oy + 9, 2, 4, 0x3aa845);
+      rect(cv, ox + 5, oy + 8, 2, 2, 0x4cc75a); rect(cv, ox + 9, oy + 8, 2, 2, 0x4cc75a);
+    } else { // đang lớn
+      rect(cv, ox + 7, oy + 6, 2, 7, 0x2f9b3b);
+      rect(cv, ox + 4, oy + 6, 3, 3, 0x4cc75a); rect(cv, ox + 9, oy + 6, 3, 3, 0x4cc75a);
+      rect(cv, ox + 5, oy + 9, 2, 2, 0x3aa845); rect(cv, ox + 9, oy + 9, 2, 2, 0x3aa845);
+    }
+    if (p.watered) { rect(cv, ox + 12, oy + 2, 2, 3, 0x4fc3f7); px(cv, ox + 12, oy + 5, 0x4fc3f7); }
+    return;
+  }
+  if (p.type === 'carrot') {
+    rect(cv, ox + 5, oy + 3, 6, 3, 0x3aa845); rect(cv, ox + 7, oy + 2, 2, 2, 0x4cc75a);
+    rect(cv, ox + 6, oy + 6, 4, 4, 0xf08a24); rect(cv, ox + 7, oy + 10, 2, 2, 0xf08a24);
+    px(cv, ox + 7, oy + 12, 0xd9731a);
+  } else if (p.type === 'tomato') {
+    rect(cv, ox + 3, oy + 3, 10, 9, 0x2f9b3b);
+    rect(cv, ox + 4, oy + 5, 3, 3, 0xe53935); rect(cv, ox + 9, oy + 6, 3, 3, 0xe53935);
+    rect(cv, ox + 6, oy + 9, 3, 3, 0xe53935);
+    px(cv, ox + 5, oy + 5, 0xff8a80); px(cv, ox + 10, oy + 6, 0xff8a80); px(cv, ox + 7, oy + 9, 0xff8a80);
+  } else {
+    rect(cv, ox + 2, oy + 5, 12, 8, 0x2e8b3a); rect(cv, ox + 3, oy + 4, 10, 1, 0x2e8b3a);
+    rect(cv, ox + 3, oy + 13, 10, 1, 0x2e8b3a);
+    for (const x of [4, 7, 10]) rect(cv, ox + x, oy + 4, 1, 10, 0x1b5e20);
+    rect(cv, ox + 4, oy + 6, 2, 1, 0x66bb6a);
+  }
+  if (p.mut) hieuUng(cv, ox, oy, p.mut);
+}
+
+// ----- nhân vật -----
+function vePlayer(cv, tx, ty, facing) {
+  const ox = tx * TS, oy = ty * TS, hair = 0x5b3a1e, skin = 0xf2c9a0;
+  rect(cv, ox + 5, oy + 13, 2, 3, 0x2d2d5a); rect(cv, ox + 9, oy + 13, 2, 3, 0x2d2d5a);
+  rect(cv, ox + 4, oy + 7, 8, 6, 0x3b6fd8);
+  rect(cv, ox + 3, oy + 8, 1, 4, skin); rect(cv, ox + 12, oy + 8, 1, 4, skin);
+  rect(cv, ox + 5, oy + 2, 6, 6, skin);
+  rect(cv, ox + 5, oy + 1, 6, 3, hair);
+  if (facing === 'down') { px(cv, ox + 6, oy + 5, 0x222222); px(cv, ox + 9, oy + 5, 0x222222); }
+  else if (facing === 'up') { rect(cv, ox + 5, oy + 1, 6, 5, hair); }
+  else if (facing === 'left') { px(cv, ox + 6, oy + 5, 0x222222); rect(cv, ox + 9, oy + 3, 2, 3, hair); }
+  else { px(cv, ox + 9, oy + 5, 0x222222); rect(cv, ox + 5, oy + 3, 2, 3, hair); }
+}
+function veKhung(cv, tx, ty, c) {
+  const ox = tx * TS, oy = ty * TS;
+  for (const [cx, cy, sx, sy] of [[0, 0, 1, 1], [TS - 1, 0, -1, 1], [0, TS - 1, 1, -1], [TS - 1, TS - 1, -1, -1]]) {
+    for (let i = 0; i < 3; i++) { px(cv, ox + cx + sx * i, oy + cy, c); px(cv, ox + cx, oy + cy + sy * i, c); }
+  }
+}
+
+function renderMap(farm, facing, now) {
+  const cv = mkCanvas(COLS * TS, ROWS * TS);
+  for (let ty = 0; ty < ROWS; ty++) {
+    for (let tx = 0; tx < COLS; tx++) {
+      const ox = tx * TS, oy = ty * TS, ch = MAP[ty][tx];
+      switch (ch) {
+        case 'T': veCay(cv, ox, oy, tx, ty); break;
+        case '~': veNuoc(cv, ox, oy, tx, ty); break;
+        case 'p': veDuong(cv, ox, oy, tx, ty); break;
+        case 'R': veMai(cv, ox, oy, tx < 4 ? 0xd9453f : tx < 8 ? 0x43a047 : 0x3f78d6); break;
+        case 'W': veTuong(cv, ox, oy); break;
+        case 'D': veCua(cv, ox, oy); break;
+        case 'f': veNPC(cv, ox, oy, tx, ty, 0xd9453f); break;
+        case 's': veNPC(cv, ox, oy, tx, ty, 0x43a047); break;
+        case 't': veNPC(cv, ox, oy, tx, ty, 0x3f78d6); break;
+        case 'F': {
+          const idx = PLOT_AT[`${tx},${ty}`];
+          veDat(cv, ox, oy, idx);
+          const p = farm.plots[idx];
+          if (p) vePlant(cv, ox, oy, p, now);
+          break;
+        }
+        default: veCo(cv, ox, oy, tx, ty);
+      }
+    }
+  }
+  const [dx, dy] = DIR[facing] || DIR.down;
+  vePlayer(cv, farm.pos.x, farm.pos.y, facing);
+  const fx = farm.pos.x + dx, fy = farm.pos.y + dy;
+  if (fx >= 0 && fy >= 0 && fx < COLS && fy < ROWS) veKhung(cv, fx, fy, 0xfff176);
+  return ghiPNG(cv, SC);
+}
+
+// ---------- Logic game ----------
+const fmtTG = (ms) => {
+  const s = Math.ceil(ms / 1000);
+  return s >= 60 ? `${Math.floor(s / 60)}p${String(s % 60).padStart(2, '0')}s` : `${s}s`;
+};
+const tenQua = (key) => {
+  const [t, mu] = key.split('|');
+  return `${SEEDS[t].e} ${SEEDS[t].ten}${mu !== 'n' ? ` ${MUT[mu].e}${MUT[mu].ten}` : ''}`;
+};
+const tongQua = (farm) => Object.values(farm.fruits).reduce((a, b) => a + b, 0);
+function tongTienBan(farm) {
+  let tong = 0;
+  for (const [k, c] of Object.entries(farm.fruits)) {
+    const [t, mu] = k.split('|');
+    tong += giaTri(t, mu === 'n' ? null : mu) * c;
+  }
+  return tong;
+}
+function dongVuon(farm, now) {
+  return farm.plots.map((p, i) => {
+    const n = `\`${i + 1}\``;
+    if (!p) return `${n} ⬜ Đất trống`;
+    const c = SEEDS[p.type];
+    let s = `${n} ${c.e} ${c.ten} — `;
+    s += now >= p.readyAt
+      ? `✅ **Chín**${p.mut ? ` ${MUT[p.mut].e}` : ''}`
+      : `⏳ ${fmtTG(p.readyAt - now)}${p.watered ? ' 💧' : ''}`;
+    if (c.toiDa > 1) s += ` (đã hái ${p.harvests}/${c.toiDa})`;
+    return s;
+  }).join('\n');
+}
+function textTui(farm) {
+  const qua = Object.entries(farm.fruits).map(([k, c]) => `${tenQua(k)} x${c}`).join('\n') || '*Chưa có trái cây*';
+  return (
+    `**🌰 Hạt giống**\n${Object.keys(SEEDS).map((k) => `${SEEDS[k].e} ${SEEDS[k].ten} x${farm.seeds[k]}`).join('\n')}\n\n` +
+    `**🧰 Dụng cụ**\n${TOOLS.binh.e} ${TOOLS.binh.ten} x${farm.binh}\n${TOOLS.xeng.e} ${TOOLS.xeng.ten} x${farm.xeng}\n\n` +
+    `**🧺 Trái cây**\n${qua}` +
+    (farm.carry ? `\n\n**🌱 Đang cầm**\n${SEEDS[farm.carry.type].e} ${SEEDS[farm.carry.type].ten}` : '')
+  );
+}
+
+// Tìm ô lân cận thỏa điều kiện (ưu tiên ô đang đối diện)
+function timO(farm, facing, pred) {
+  const thuTu = [facing, ...['up', 'down', 'left', 'right'].filter((d) => d !== facing)];
+  for (const d of thuTu) {
+    const x = farm.pos.x + DIR[d][0], y = farm.pos.y + DIR[d][1];
+    const ch = tileAt(x, y);
+    if (pred(x, y, ch)) return { x, y, ch, d };
+  }
+  return null;
+}
+
+function thuHoach(farm, idx, now) {
+  const p = farm.plots[idx];
+  const cfg = SEEDS[p.type];
+  const key = `${p.type}|${p.mut || 'n'}`;
+  farm.fruits[key] = (farm.fruits[key] || 0) + 1;
+  p.harvests++;
+  let them = '';
+  if (p.harvests >= cfg.toiDa) {
+    farm.plots[idx] = null;
+    if (cfg.toiDa > 1) them = ' Cây đã tàn, ô đất trống trở lại.';
+  } else {
+    p.cycleStart = now;
+    p.readyAt = now + cfg.tgLai * 1000;
+    p.watered = false;
+    p.mut = rollMut();
+    them = ` Cây sẽ ra quả mới sau ${fmtTG(cfg.tgLai * 1000)}.`;
+  }
+  return `🧺 Thu hoạch **${tenQua(key)}**!${them}`;
+}
+
+// Xử lý 1 thao tác (đồng bộ). Trả về nothing, cập nhật u, s.
+function xuLyGame(u, s, act, arg) {
+  const farm = getFarm(u);
+  const now = Date.now();
+  s.msg = '';
+  switch (act) {
+    case 'up': case 'down': case 'left': case 'right': {
+      s.facing = act;
+      const nx = farm.pos.x + DIR[act][0], ny = farm.pos.y + DIR[act][1];
+      if (DI_DUOC.has(tileAt(nx, ny))) { farm.pos.x = nx; farm.pos.y = ny; save(); }
+      else if (!'fstF'.includes(tileAt(nx, ny))) s.msg = '🚧 Có vật cản phía trước.';
+      break;
+    }
+    case 'refresh': break;
+    case 'back': s.mode = 'map'; break;
+    case 'quit': s.mode = 'end'; break;
+    case 'bag': s.mode = 'bag'; break;
+    case 'qty': s.qty = s.qty === 1 ? 5 : s.qty === 5 ? 10 : 1; break;
+
+    case 'act': {
+      const o = timO(farm, s.facing, (x, y, ch) => 'fstF'.includes(ch));
+      if (!o) { s.msg = '🤔 Không có gì để tương tác. Hãy đứng cạnh ô đất hoặc NPC (khung vàng là ô đang nhìn tới).'; break; }
+      s.facing = o.d;
+      if (o.ch === 'f') { s.mode = 'shop_fruit'; break; }
+      if (o.ch === 's') { s.mode = 'shop_seed'; break; }
+      if (o.ch === 't') { s.mode = 'shop_tool'; break; }
+      const idx = PLOT_AT[`${o.x},${o.y}`];
+      const p = farm.plots[idx];
+      if (!p) {
+        if (farm.carry) {
+          farm.plots[idx] = farm.carry; farm.carry = null; save();
+          s.msg = `🌱 Đã đặt cây xuống vườn **#${idx + 1}**.`;
+        } else { s.mode = 'plant'; s.plotIdx = idx; }
+      } else if (now >= p.readyAt) {
+        s.msg = thuHoach(farm, idx, now); save();
+      } else {
+        s.msg = `⏳ ${SEEDS[p.type].e} Vườn **#${idx + 1}** còn **${fmtTG(p.readyAt - now)}** nữa mới chín.`;
+      }
+      break;
+    }
+
+    case 'plant': {
+      const idx = s.plotIdx;
+      if (farm.plots[idx]) { s.msg = '❌ Ô đất này đã có cây.'; s.mode = 'map'; break; }
+      if (!SEEDS[arg] || farm.seeds[arg] < 1) { s.msg = '❌ Bạn không có hạt giống này.'; break; }
+      farm.seeds[arg]--;
+      farm.plots[idx] = {
+        type: arg, cycleStart: now, readyAt: now + SEEDS[arg].tgLon * 1000,
+        harvests: 0, mut: rollMut(), watered: false,
+      };
+      save();
+      s.mode = 'map';
+      s.msg = `🌱 Đã trồng **${SEEDS[arg].e} ${SEEDS[arg].ten}** ở vườn **#${idx + 1}**. Chín sau ${fmtTG(SEEDS[arg].tgLon * 1000)}.`;
+      break;
+    }
+
+    case 'water': {
+      const o = timO(farm, s.facing, (x, y, ch) => {
+        if (ch !== 'F') return false;
+        const p = farm.plots[PLOT_AT[`${x},${y}`]];
+        return p && now < p.readyAt && !p.watered;
+      });
+      if (!o) { s.msg = '💧 Không có cây nào cần tưới ở cạnh bạn (cây phải đang lớn và chưa được tưới).'; break; }
+      if (farm.binh < 1) { s.msg = '❌ Bạn hết bình tưới nước. Mua ở cửa hàng đồ dùng!'; break; }
+      const idx = PLOT_AT[`${o.x},${o.y}`];
+      const p = farm.plots[idx];
+      farm.binh--;
+      p.readyAt = now + Math.floor((p.readyAt - now) / 2);
+      p.watered = true;
+      s.facing = o.d;
+      save();
+      s.msg = `💧 Đã tưới vườn **#${idx + 1}**, thời gian chờ còn **${fmtTG(p.readyAt - now)}**.`;
+      break;
+    }
+
+    case 'dig': {
+      if (farm.carry) { s.msg = '❌ Bạn đang cầm một cây rồi, hãy đặt xuống ô đất trống (✋ Tương tác) trước.'; break; }
+      const o = timO(farm, s.facing, (x, y, ch) => ch === 'F' && farm.plots[PLOT_AT[`${x},${y}`]]);
+      if (!o) { s.msg = '⛏️ Không có cây nào ở cạnh bạn để xúc.'; break; }
+      if (farm.xeng < 1) { s.msg = '❌ Bạn không có xẻng. Mua ở cửa hàng đồ dùng!'; break; }
+      const idx = PLOT_AT[`${o.x},${o.y}`];
+      farm.xeng--;
+      farm.carry = farm.plots[idx];
+      farm.plots[idx] = null;
+      s.facing = o.d;
+      save();
+      s.msg = `⛏️ Đã xúc cây ở vườn **#${idx + 1}**. Đến ô đất trống và bấm ✋ để đặt xuống.`;
+      break;
+    }
+
+    case 'buy': {
+      const qty = s.qty;
+      if (SEEDS[arg]) {
+        const cost = SEEDS[arg].gia * qty;
+        if (u.balance < cost) { s.msg = `❌ Không đủ tiền (cần ${fmt(cost)}).`; break; }
+        u.balance -= cost; farm.seeds[arg] += qty; save();
+        s.msg = `🛒 Đã mua **${qty}x ${SEEDS[arg].e} ${SEEDS[arg].ten}** với giá ${fmt(cost)}.`;
+      } else if (TOOLS[arg]) {
+        const cost = TOOLS[arg].gia * qty;
+        if (u.balance < cost) { s.msg = `❌ Không đủ tiền (cần ${fmt(cost)}).`; break; }
+        u.balance -= cost; farm[arg] += qty; save();
+        s.msg = `🛒 Đã mua **${qty}x ${TOOLS[arg].e} ${TOOLS[arg].ten}** với giá ${fmt(cost)}.`;
+      }
+      break;
+    }
+
+    case 'sellall': {
+      const n = tongQua(farm);
+      if (!n) { s.msg = '❌ Bạn chưa có trái cây nào để bán.'; break; }
+      const tong = tongTienBan(farm);
+      u.balance += tong; farm.fruits = {}; save();
+      s.msg = `💰 Đã bán **${n}** trái cây, nhận **+${fmt(tong)}**.`;
+      break;
+    }
+  }
+}
+
+// ---------- Giao diện ----------
+const nut = (id, label, emj, style = ButtonStyle.Secondary, dis = false) => {
+  const b = new ButtonBuilder().setCustomId(`g2:${id}`).setStyle(style).setDisabled(dis);
+  if (label) b.setLabel(label);
+  if (emj) b.setEmoji(emj);
+  return b;
+};
+const hang = (...btns) => new ActionRowBuilder().addComponents(btns);
+
+function veGame(user, u, s, edit) {
+  const farm = getFarm(u);
+  const now = Date.now();
+  const ten = `g2_${now}.png`;
+  const file = new AttachmentBuilder(renderMap(farm, s.facing, now), { name: ten });
+  const embed = khung(user, MAU.thang, `🌱 VƯỜN CỦA ${(user.displayName || user.username).toUpperCase()}`)
+    .setImage(`attachment://${ten}`);
+  let rows = [];
+  let mota = s.msg || '';
+
+  if (s.mode === 'map') {
+    if (!mota) mota = 'Di chuyển bằng mũi tên, đứng cạnh **ô đất** hoặc **NPC** rồi bấm ✋ Tương tác.';
+    embed.setDescription(mota).addFields(
+      { name: '💰 Số dư', value: `**${fmt(u.balance)}**`, inline: true },
+      {
+        name: '🎒 Túi đồ',
+        value:
+          Object.keys(SEEDS).map((k) => `${SEEDS[k].e}x${farm.seeds[k]}`).join(' ') + '\n' +
+          `${TOOLS.binh.e}x${farm.binh} ${TOOLS.xeng.e}x${farm.xeng} 🧺x${tongQua(farm)}` +
+          (farm.carry ? `\n🌱 Đang cầm: ${SEEDS[farm.carry.type].e}` : ''),
+        inline: true,
+      },
+      { name: '🌿 Khu vườn', value: dongVuon(farm, now) }
+    );
+    rows = [
+      hang(nut('left', null, '⬅️'), nut('up', null, '⬆️'), nut('down', null, '⬇️'), nut('right', null, '➡️'),
+        nut('act', 'Tương tác', '✋', ButtonStyle.Primary)),
+      hang(nut('water', 'Tưới', '💧'), nut('dig', 'Xẻng', '⛏️'), nut('bag', 'Túi', '🎒'),
+        nut('refresh', null, '🔄'), nut('quit', null, '✖️', ButtonStyle.Danger)),
+    ];
+  } else if (s.mode === 'shop_seed') {
+    const ds = Object.keys(SEEDS).map((k) => {
+      const c = SEEDS[k];
+      return `${c.e} **${c.ten}** — ${c.gia} vnđ • lớn ${fmtTG(c.tgLon * 1000)} • ${c.mota} • bán ${c.banGia} vnđ/trái`;
+    }).join('\n');
+    embed.setDescription(
+      `🧑‍🌾 *"Chào mừng đến cửa hàng hạt giống!"*\n\n${ds}\n\n` +
+      `Quả có thể mọc **${MUT.vang.e} Vàng** (x${MUT.vang.nhan} giá) hoặc **${MUT.cv.e} Cầu vồng** (x${MUT.cv.nhan} giá)!` +
+      (mota ? `\n\n${mota}` : '')
+    ).addFields({ name: '💰 Số dư', value: `**${fmt(u.balance)}**`, inline: true });
+    rows = [
+      hang(...Object.keys(SEEDS).map((k) =>
+        nut(`buy:${k}`, `${SEEDS[k].ten} • ${SEEDS[k].gia * s.qty}`, SEEDS[k].e, ButtonStyle.Success, u.balance < SEEDS[k].gia * s.qty))),
+      hang(nut('qty', `Số lượng: x${s.qty}`, '🔢'), nut('back', 'Quay lại', '↩️')),
+    ];
+  } else if (s.mode === 'shop_tool') {
+    const ds = Object.keys(TOOLS).map((k) => `${TOOLS[k].e} **${TOOLS[k].ten}** — ${TOOLS[k].gia} vnđ • ${TOOLS[k].mota}`).join('\n');
+    embed.setDescription(`🧑‍🔧 *"Cần đồ nghề gì nào?"*\n\n${ds}` + (mota ? `\n\n${mota}` : ''))
+      .addFields({ name: '💰 Số dư', value: `**${fmt(u.balance)}**`, inline: true });
+    rows = [
+      hang(...Object.keys(TOOLS).map((k) =>
+        nut(`buy:${k}`, `${TOOLS[k].ten} • ${TOOLS[k].gia * s.qty}`, TOOLS[k].e, ButtonStyle.Success, u.balance < TOOLS[k].gia * s.qty))),
+      hang(nut('qty', `Số lượng: x${s.qty}`, '🔢'), nut('back', 'Quay lại', '↩️')),
+    ];
+  } else if (s.mode === 'shop_fruit') {
+    const ds = Object.entries(farm.fruits).map(([k, c]) => {
+      const [t, mu] = k.split('|');
+      return `${tenQua(k)} x${c} — ${giaTri(t, mu === 'n' ? null : mu)} vnđ/trái`;
+    }).join('\n') || '*Bạn chưa có trái cây nào.*';
+    embed.setDescription(`🧑‍🌾 *"Trái cây tươi à? Tôi thu mua hết!"*\n\n${ds}\n\n**Tổng:** ${fmt(tongTienBan(farm))}` + (mota ? `\n\n${mota}` : ''))
+      .addFields({ name: '💰 Số dư', value: `**${fmt(u.balance)}**`, inline: true });
+    rows = [hang(nut('sellall', 'Bán tất cả', '💰', ButtonStyle.Success, tongQua(farm) === 0), nut('back', 'Quay lại', '↩️'))];
+  } else if (s.mode === 'plant') {
+    embed.setDescription(`🌱 Chọn hạt giống để trồng ở vườn **#${s.plotIdx + 1}**` +
+      (mota ? `\n\n${mota}` : ''));
+    rows = [
+      hang(...Object.keys(SEEDS).map((k) =>
+        nut(`plant:${k}`, `${SEEDS[k].ten} (x${farm.seeds[k]})`, SEEDS[k].e, ButtonStyle.Success, farm.seeds[k] < 1))),
+      hang(nut('back', 'Quay lại', '↩️')),
+    ];
+  } else if (s.mode === 'bag') {
+    embed.setDescription(textTui(farm)).addFields({ name: '💰 Số dư', value: `**${fmt(u.balance)}**`, inline: true });
+    rows = [hang(nut('back', 'Quay lại', '↩️'))];
+  } else { // end
+    embed.setColor(MAU.xam).setDescription('👋 Đã đóng khu vườn. Cây vẫn tiếp tục lớn, dùng `!game2d` để quay lại!');
+  }
+
+  const payload = { embeds: [embed], components: rows, files: [file] };
+  if (edit) payload.attachments = []; // xóa ảnh cũ khi cập nhật tin nhắn
+  return payload;
+}
+
+const gameSessions = new Map(); // userId -> { collector, msg }
+
+async function khoiDongGame(m) {
+  const uid = m.author.id;
+  const u = getUser(uid);
+  const cu = gameSessions.get(uid);
+  if (cu) cu.collector.stop('replaced'); // mỗi người chỉ 1 phiên
+
+  const s = { mode: 'map', facing: 'down', msg: '', qty: 1, plotIdx: 0 };
+  const msg = await reply(m, veGame(m.author, u, s, false));
+  const collector = msg.createMessageComponentCollector({ idle: GAME_IDLE });
+  const sess = { collector, msg };
+  gameSessions.set(uid, sess);
+
+  collector.on('collect', async (i) => {
+    if (i.user.id !== uid) {
+      return i.reply({
+        content: 'Đây không phải khu vườn của bạn! Dùng `!game2d` để mở vườn riêng.',
+        flags: MessageFlags.Ephemeral,
+      }).catch(() => {});
+    }
+    const me = getUser(uid);
+    if (!me) return;
+    const [, act, arg] = i.customId.split(':');
+    try {
+      xuLyGame(me, s, act, arg);
+      await i.update(veGame(i.user, me, s, true));
+      if (s.mode === 'end') collector.stop('quit');
+    } catch (e) {
+      console.error('Lỗi game2d:', e);
+    }
+  });
+  collector.on('end', (_, reason) => {
+    if (gameSessions.get(uid) === sess) gameSessions.delete(uid);
+    if (reason !== 'quit') msg.edit({ components: [] }).catch(() => {});
+  });
+}
+
+lenh.set('game2d', (m) => khoiDongGame(m));
+
 
 // ===================== KHỞI ĐỘNG BOT =====================
 client.once('clientReady', () => console.log(`Bot đã online: ${client.user.tag}`));
