@@ -1,12 +1,16 @@
 {
-  "name": "taixiu-bot",
+  "name": "bot-taixiu-discord",
   "version": "1.0.0",
-  "description": "Discord Bot Roleplay & Taixiu",
+  "description": "Bot Discord: tài xỉu, bài 3 cây, bầu cua",
   "main": "bot.js",
   "scripts": {
     "start": "node bot.js"
   },
+  "engines": {
+    "node": ">=18"
+  },
   "dependencies": {
-    "discord.js": "^14.14.0"
+    "discord.js": "^14.16.3",
+    "dotenv": "^16.4.5"
   }
 }
