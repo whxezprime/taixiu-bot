@@ -12,7 +12,7 @@ const fs = require('fs');
 const path = require('path');
 const {
   Client, GatewayIntentBits, EmbedBuilder, ActionRowBuilder, ButtonBuilder,
-  ButtonStyle, PermissionsBitField, MessageFlags, AttachmentBuilder,
+  ButtonStyle, PermissionsBitField, MessageFlags, AttachmentBuilder, StringSelectMenuBuilder,
 } = require('discord.js');
 
 const TOKEN = process.env.DISCORD_TOKEN;
@@ -26,6 +26,7 @@ const client = new Client({
     GatewayIntentBits.Guilds,
     GatewayIntentBits.GuildMessages,
     GatewayIntentBits.MessageContent,
+    GatewayIntentBits.GuildVoiceStates, // cần cho nhạc trong kênh voice
   ],
 });
 
@@ -542,6 +543,12 @@ lenh.set('helptx', (m) => {
       {
         name: '🌱 Game trồng cây',
         value: '`/game2d` — chọn **🌱 trồng cây** (multiplayer, mỗi người 1 vườn 8 ô) hoặc **🐍 rắn ăn táo** (20 màn, thắng mỗi màn +100 vnđ). Khung chơi chỉ mình bạn thấy.',
+      },
+      {
+        name: '🎧 Nhạc (Spotify / SoundCloud / TikTok)',
+        value:
+          '`/playmusic link:` (hoặc `/pm`) — phát nhạc • `/search tukhoa:` — tìm 10 bài\n' +
+          '`/join` • `/out` • `/stop` (tạm dừng) • `/resume` • `/skip` • `/volume 0-200`',
       },
       {
         name: '📈 Trader (giá Coin đổi mỗi 30 giây)',
@@ -2169,6 +2176,10 @@ function snXuLy(u, sess, act) {
   }
 }
 
+// Nút của rắn ăn táo dùng tiền tố 'sn:' (khác 'g2:' của game trồng cây)
+const nutSn = (id, label, emj, style = ButtonStyle.Secondary, dis = false) =>
+  nut(id, label, emj, style, dis).setCustomId(`sn:${id}`);
+
 function snVeGame(sess, u, edit) {
   const user = sess.user;
   const ten = `sn_${Date.now()}.png`;
@@ -2188,9 +2199,9 @@ function snVeGame(sess, u, edit) {
       (het ? '\n\n🏆 Bạn đã hoàn thành cả 20 màn!' : '')
     ).addFields({ name: '💰 Số dư', value: `**${fmt(u.balance)}**`, inline: true });
     rows = [hang(
-      nut('continue', 'Màn tiếp', '▶️', ButtonStyle.Success, sess.lv + 1 >= SN_LEVELS.length),
-      nut('reset', 'Chơi lại', '🔄'),
-      nut('menu', 'Menu', '📋'))];
+      nutSn('continue', 'Màn tiếp', '▶️', ButtonStyle.Success, sess.lv + 1 >= SN_LEVELS.length),
+      nutSn('reset', 'Chơi lại', '🔄'),
+      nutSn('menu', 'Menu', '📋'))];
   } else {
     embed.setDescription(
       sess.msg || 'Ăn hết 🍎 để mở **hố đen**, rồi chui vào hố đen! Rắn sẽ rơi nếu không có chỗ tựa.'
@@ -2202,10 +2213,10 @@ function snVeGame(sess, u, edit) {
       { name: '📊 Tiến độ', value: `${xong}/${SN_LEVELS.length} màn`, inline: true }
     );
     rows = [
-      hang(nut('left', null, '⬅️'), nut('up', null, '⬆️'), nut('down', null, '⬇️'), nut('right', null, '➡️'),
-        nut('undo', 'Hoàn tác', '↩️', ButtonStyle.Primary, !sess.hist.length)),
-      hang(nut('reset', 'Làm lại', '🔄'), nut('prev', null, '⏮️', ButtonStyle.Secondary, sess.lv === 0),
-        nut('next', null, '⏭️', ButtonStyle.Secondary, sess.lv >= mo), nut('menu', 'Menu', '📋')),
+      hang(nutSn('left', null, '⬅️'), nutSn('up', null, '⬆️'), nutSn('down', null, '⬇️'), nutSn('right', null, '➡️'),
+        nutSn('undo', 'Hoàn tác', '↩️', ButtonStyle.Primary, !sess.hist.length)),
+      hang(nutSn('reset', 'Làm lại', '🔄'), nutSn('prev', null, '⏮️', ButtonStyle.Secondary, sess.lv === 0),
+        nutSn('next', null, '⏭️', ButtonStyle.Secondary, sess.lv >= mo), nutSn('menu', 'Menu', '📋')),
     ];
   }
   const payload = { embeds: [embed], components: rows, files: [file] };
@@ -2410,6 +2421,436 @@ lenh.set('sell', (m, args) => {
 });
 
 
+// ===================== NHẠC TRONG KÊNH VOICE =====================
+// Lệnh: /playmusic (hoặc /pm) link:  • /join • /volume 0-200 • /out • /stop (tạm dừng) • /resume • /skip • /search tukhoa:
+// Hỗ trợ link SoundCloud, Spotify (track/album/playlist) và TikTok.
+// Cần cài trên máy chạy bot: Node >= 22.12, ffmpeg (hoặc để npm tự cài ffmpeg-static) và yt-dlp.
+// Biến môi trường (tùy chọn): YTDLP_PATH (đường dẫn yt-dlp), SPOTIFY_CLIENT_ID + SPOTIFY_CLIENT_SECRET
+// (để tìm kiếm Spotify và đọc album/playlist Spotify).
+let Voice = null;
+try { Voice = require('@discordjs/voice'); } catch { console.warn('Chưa cài @discordjs/voice: các lệnh nhạc sẽ không hoạt động (chạy npm install).'); }
+const { spawn } = require('child_process');
+const { PassThrough } = require('stream');
+
+const YTDLP = process.env.YTDLP_PATH || 'yt-dlp';
+const SPOTIFY_ID = process.env.SPOTIFY_CLIENT_ID;
+const SPOTIFY_SECRET = process.env.SPOTIFY_CLIENT_SECRET;
+const NHAC_ROI_SAU = 5 * 60 * 1000;  // hàng chờ hết và không ai nghe thì tự thoát sau 5 phút
+const NHAC_TOI_DA_DS = 30;           // tối đa số bài lấy từ 1 playlist/album
+
+const LENH_SLASH = [
+  { name: 'game2d', description: 'Chọn game: trồng cây multiplayer hoặc rắn ăn táo (chỉ mình bạn nhìn thấy)' },
+  { name: 'playmusic', description: 'Phát nhạc từ link Spotify / SoundCloud / TikTok (hoặc từ khóa)', options: [{ type: 3, name: 'link', description: 'Link bài hát hoặc từ khóa', required: true }] },
+  { name: 'pm', description: 'Giống /playmusic: phát nhạc từ link Spotify / SoundCloud / TikTok', options: [{ type: 3, name: 'link', description: 'Link bài hát hoặc từ khóa', required: true }] },
+  { name: 'join', description: 'Bot vào kênh voice bạn đang ở' },
+  { name: 'volume', description: 'Chỉnh âm lượng (0-200)', options: [{ type: 4, name: 'volume', description: 'Âm lượng từ 0 đến 200 (100 = bình thường)', required: true, minValue: 0, maxValue: 200 }] },
+  { name: 'out', description: 'Bot thoát khỏi kênh voice' },
+  { name: 'stop', description: 'Tạm dừng bài hát' },
+  { name: 'resume', description: 'Tiếp tục phát bài hát' },
+  { name: 'skip', description: 'Bỏ qua bài hát hiện tại' },
+  { name: 'search', description: 'Tìm 10 bài hát trên Spotify và SoundCloud', options: [{ type: 3, name: 'tukhoa', description: 'Từ khóa tìm kiếm', required: true }] },
+];
+const LENH_NHAC = new Set(['playmusic', 'pm', 'join', 'volume', 'out', 'stop', 'resume', 'skip', 'search']);
+
+const NGUON = {
+  soundcloud: '☁️ SoundCloud', spotify: '🟢 Spotify', tiktok: '🎵 TikTok', khac: '🌐 Khác',
+};
+const fmtDur = (s) => (s ? `${Math.floor(s / 60)}:${String(Math.floor(s % 60)).padStart(2, '0')}` : '—');
+const cat = (str, n) => (str.length > n ? str.slice(0, n - 1) + '…' : str);
+const loiRieng = (i, t) => i.reply({ content: `❌ ${t}`, flags: MessageFlags.Ephemeral }).catch(() => {});
+const suaLoi = (i, t) => i.editReply({ content: `❌ ${t}`, embeds: [], components: [] }).catch(() => {});
+
+// ---------- Chạy yt-dlp ----------
+function chayYtdlp(args, timeout = 60000) {
+  return new Promise((resolve, reject) => {
+    const p = spawn(YTDLP, args, { stdio: ['ignore', 'pipe', 'pipe'] });
+    let out = '', err = '';
+    const t = setTimeout(() => { p.kill('SIGKILL'); reject(new Error('yt-dlp chạy quá lâu')); }, timeout);
+    p.stdout.on('data', (d) => { out += d; });
+    p.stderr.on('data', (d) => { err += d; });
+    p.on('error', (e) => { clearTimeout(t); reject(new Error(e.code === 'ENOENT' ? 'Máy chủ chưa cài yt-dlp' : e.message)); });
+    p.on('close', (c) => {
+      clearTimeout(t);
+      if (c === 0) resolve(out);
+      else reject(new Error(cat(err.trim().split('\n').pop() || `yt-dlp lỗi (${c})`, 200)));
+    });
+  });
+}
+const nguonTuUrl = (url) => (/soundcloud\.com/i.test(url) ? 'soundcloud' : /tiktok\.com/i.test(url) ? 'tiktok' : 'khac');
+function entryToTrack(e, src) {
+  const url = e.webpage_url || e.url;
+  if (!url) return null;
+  return {
+    title: cat(String(e.title || 'Không rõ tên'), 100),
+    artist: e.uploader || e.artist || e.channel || '',
+    dur: e.duration ? Math.round(e.duration) : null,
+    url, src: src || nguonTuUrl(url), thumb: e.thumbnail || (e.thumbnails && e.thumbnails.length ? e.thumbnails[e.thumbnails.length - 1].url : null),
+  };
+}
+// Lấy thông tin 1 link (hoặc cả playlist/set)
+async function layThongTin(url) {
+  const j = JSON.parse(await chayYtdlp(['--flat-playlist', '-J', '--no-warnings', url]));
+  const src = nguonTuUrl(url);
+  if (Array.isArray(j.entries)) {
+    return j.entries.slice(0, NHAC_TOI_DA_DS).map((e) => entryToTrack(e, src)).filter(Boolean);
+  }
+  const t = entryToTrack({ ...j, webpage_url: j.webpage_url || url }, src);
+  return t ? [t] : [];
+}
+async function timKiemSC(q, n) {
+  const j = JSON.parse(await chayYtdlp(['--flat-playlist', '-J', '--no-warnings', `scsearch${n}:${q}`]));
+  return (j.entries || []).map((e) => entryToTrack(e, 'soundcloud')).filter(Boolean);
+}
+
+// ---------- TikTok dự phòng (khi yt-dlp lỗi) ----------
+async function tiktokDuPhong(url) {
+  const r = await fetch('https://www.tikwm.com/api/?url=' + encodeURIComponent(url));
+  const j = await r.json();
+  if (!j || j.code !== 0 || !j.data) throw new Error('Không đọc được link TikTok');
+  const d = j.data;
+  let direct = d.music || d.play;
+  if (!direct) throw new Error('Link TikTok này không có âm thanh');
+  if (direct.startsWith('/')) direct = 'https://www.tikwm.com' + direct;
+  return [{
+    title: cat(String(d.title || 'TikTok'), 100), artist: (d.author && d.author.nickname) || 'TikTok',
+    dur: d.duration || null, direct, url, src: 'tiktok', thumb: d.cover || null,
+  }];
+}
+
+// ---------- Spotify ----------
+const RE_SP = /open\.spotify\.com\/(?:intl-[a-z]+\/)?(track|album|playlist)\/([A-Za-z0-9]+)/i;
+let spTok = { t: '', exp: 0 };
+async function spToken() {
+  if (!SPOTIFY_ID || !SPOTIFY_SECRET) return null;
+  if (spTok.t && Date.now() < spTok.exp) return spTok.t;
+  const r = await fetch('https://accounts.spotify.com/api/token', {
+    method: 'POST',
+    headers: {
+      Authorization: 'Basic ' + Buffer.from(`${SPOTIFY_ID}:${SPOTIFY_SECRET}`).toString('base64'),
+      'Content-Type': 'application/x-www-form-urlencoded',
+    },
+    body: 'grant_type=client_credentials',
+  });
+  if (!r.ok) throw new Error('Spotify từ chối SPOTIFY_CLIENT_ID/SECRET');
+  const j = await r.json();
+  spTok = { t: j.access_token, exp: Date.now() + (j.expires_in - 60) * 1000 };
+  return spTok.t;
+}
+async function spGet(p) {
+  const tk = await spToken();
+  const r = await fetch('https://api.spotify.com/v1' + p, { headers: { Authorization: 'Bearer ' + tk } });
+  if (!r.ok) throw new Error('Spotify lỗi ' + r.status);
+  return r.json();
+}
+const spTrack = (t) => {
+  const ar = (t.artists || []).map((a) => a.name);
+  return {
+    title: cat(t.name || 'Không rõ tên', 100), artist: ar.join(', '),
+    dur: t.duration_ms ? Math.round(t.duration_ms / 1000) : null,
+    query: `${ar[0] || ''} ${t.name || ''}`.trim(), // Spotify không cho phát trực tiếp -> tìm bản tương ứng để phát
+    url: (t.external_urls && t.external_urls.spotify) || '', src: 'spotify',
+    thumb: t.album && t.album.images && t.album.images[0] ? t.album.images[0].url : null,
+  };
+};
+const giaiMaHtml = (s) => s.replace(/&amp;/g, '&').replace(/&quot;/g, '"').replace(/&#x27;|&#39;/g, "'").replace(/&lt;/g, '<').replace(/&gt;/g, '>');
+async function giaiSpotify(url) {
+  const [, loai, id] = url.match(RE_SP);
+  if (await spToken()) {
+    if (loai === 'track') return [spTrack(await spGet(`/tracks/${id}`))];
+    if (loai === 'album') {
+      const al = await spGet(`/albums/${id}`);
+      return al.tracks.items.slice(0, NHAC_TOI_DA_DS).map((t) => spTrack({ ...t, album: al }));
+    }
+    const pl = await spGet(`/playlists/${id}/tracks?limit=${NHAC_TOI_DA_DS}&fields=items(track(name,artists(name),duration_ms,external_urls,album(images)))`);
+    return pl.items.map((x) => x.track).filter(Boolean).map(spTrack);
+  }
+  if (loai !== 'track') throw new Error('Album/playlist Spotify cần đặt SPOTIFY_CLIENT_ID và SPOTIFY_CLIENT_SECRET trên máy chủ.');
+  // Không có tài khoản API: đọc tên bài + ca sĩ từ trang công khai
+  const r = await fetch(`https://open.spotify.com/track/${id}`, {
+    headers: { 'User-Agent': 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/120 Safari/537.36', 'Accept-Language': 'en-US,en;q=0.9' },
+  });
+  const html = await r.text();
+  const og = (p) => { const m = html.match(new RegExp(`<meta property="og:${p}" content="([^"]*)"`)); return m ? giaiMaHtml(m[1]) : ''; };
+  const title = og('title');
+  if (!title) throw new Error('Không đọc được bài hát Spotify này');
+  const artist = (og('description').split('·')[0] || '').replace(/^Listen to .* on Spotify\.?\s*/i, '').trim();
+  return [{ title: cat(title, 100), artist, dur: null, query: `${artist} ${title}`.trim(), url, src: 'spotify', thumb: og('image') || null }];
+}
+async function spTimKiem(q, n) {
+  const j = await spGet(`/search?q=${encodeURIComponent(q)}&type=track&limit=${n}`);
+  return j.tracks.items.map(spTrack);
+}
+
+// Đổi link/từ khóa người dùng nhập thành danh sách bài
+async function giaiDauVao(input) {
+  input = input.trim();
+  if (RE_SP.test(input)) return giaiSpotify(input);
+  if (/^https?:\/\//i.test(input)) {
+    try {
+      const ds = await layThongTin(input);
+      if (ds.length) return ds;
+      throw new Error('Link này không có bài hát nào');
+    } catch (e) {
+      if (/tiktok\.com/i.test(input)) return tiktokDuPhong(input);
+      throw e;
+    }
+  }
+  const r = await timKiemSC(input, 1);
+  if (!r.length) throw new Error('Không tìm thấy bài nào với từ khóa này.');
+  return r;
+}
+
+// ---------- Lấy luồng âm thanh ----------
+function moYtdlp(input) {
+  return new Promise((resolve, reject) => {
+    const p = spawn(YTDLP, ['-f', 'bestaudio/best', '--no-playlist', '-q', '--no-warnings', '--no-part', '-o', '-', input], { stdio: ['ignore', 'pipe', 'pipe'] });
+    const pass = new PassThrough();
+    let co = false, err = '';
+    p.stderr.on('data', (d) => { err += d; });
+    p.on('error', (e) => reject(new Error(e.code === 'ENOENT' ? 'Máy chủ chưa cài yt-dlp' : e.message)));
+    p.stdout.once('data', (chunk) => { co = true; pass.write(chunk); p.stdout.pipe(pass); resolve({ stream: pass, proc: p }); });
+    p.on('close', () => { if (!co) reject(new Error(cat(err.trim().split('\n').pop() || 'Không lấy được âm thanh', 200))); });
+  });
+}
+async function taoNguon(t) {
+  const { createAudioResource, StreamType } = Voice;
+  if (t.direct) return { resource: createAudioResource(t.direct, { inlineVolume: true }), proc: null };
+  const ds = t.query ? [`scsearch1:${t.query}`, `ytsearch1:${t.query}`] : [t.url];
+  let loiCuoi = new Error('Không lấy được âm thanh');
+  for (const inp of ds) {
+    try {
+      const { stream, proc } = await moYtdlp(inp);
+      return { resource: createAudioResource(stream, { inputType: StreamType.Arbitrary, inlineVolume: true }), proc };
+    } catch (e) { loiCuoi = e; }
+  }
+  throw loiCuoi;
+}
+
+// ---------- Trạng thái phát nhạc của từng server ----------
+const musik = new Map(); // guildId -> {conn, player, queue, cur, resource, proc, vol, textCh, vcId, dangMo, leaveTimer}
+
+function embedDangPhat(t, g) {
+  const e = khung(t.by || null, MAU.tim, '🎶 ĐANG PHÁT')
+    .setDescription(`**${t.url ? `[${t.title}](${t.url})` : t.title}**`)
+    .addFields(
+      { name: '🎤 Nghệ sĩ / kênh', value: t.artist || '—', inline: true },
+      { name: '⏱️ Thời lượng', value: fmtDur(t.dur), inline: true },
+      { name: '📻 Nguồn', value: NGUON[t.src] || NGUON.khac, inline: true },
+      { name: '📜 Hàng chờ', value: `${g.queue.length} bài`, inline: true },
+      { name: '🔊 Âm lượng', value: `${g.vol}%`, inline: true }
+    );
+  if (t.thumb) e.setThumbnail(t.thumb);
+  return e;
+}
+function datRoi(g) {
+  clearTimeout(g.leaveTimer);
+  g.leaveTimer = setTimeout(() => {
+    if (!g.cur && !g.queue.length) {
+      g.textCh.send('👋 Không còn bài nào trong hàng chờ, mình rời kênh voice nhé!').catch(() => {});
+      roiKenh(g.guildId);
+    }
+  }, NHAC_ROI_SAU);
+}
+function roiKenh(guildId) {
+  const g = musik.get(guildId);
+  if (!g) return;
+  clearTimeout(g.leaveTimer);
+  g.queue = []; g.cur = null;
+  if (g.proc) { try { g.proc.kill('SIGKILL'); } catch {} g.proc = null; }
+  try { g.player.stop(true); } catch {}
+  try { if (g.conn.state.status !== Voice.VoiceConnectionStatus.Destroyed) g.conn.destroy(); } catch {}
+  musik.delete(guildId);
+}
+
+async function vaoKenh(guild, vc, textCh) {
+  const { joinVoiceChannel, createAudioPlayer, entersState, VoiceConnectionStatus, AudioPlayerStatus, NoSubscriberBehavior } = Voice;
+  let g = musik.get(guild.id);
+  if (g && g.vcId === vc.id && g.conn.state.status !== VoiceConnectionStatus.Destroyed) { g.textCh = textCh; return g; }
+  const conn = joinVoiceChannel({ channelId: vc.id, guildId: guild.id, adapterCreator: guild.voiceAdapterCreator, selfDeaf: true });
+  try {
+    await entersState(conn, VoiceConnectionStatus.Ready, 20000);
+  } catch {
+    try { conn.destroy(); } catch {}
+    throw new Error('Không vào được kênh voice (kiểm tra quyền Connect/Speak của bot).');
+  }
+  if (!g) {
+    const player = createAudioPlayer({ behaviors: { noSubscriber: NoSubscriberBehavior.Pause } });
+    g = { guildId: guild.id, conn, player, queue: [], cur: null, resource: null, proc: null, vol: 100, textCh, vcId: vc.id, dangMo: false, leaveTimer: null };
+    musik.set(guild.id, g);
+    player.on(AudioPlayerStatus.Idle, () => {
+      if (g.proc) { try { g.proc.kill('SIGKILL'); } catch {} g.proc = null; }
+      g.cur = null; g.resource = null;
+      if (!g.dangMo) phatBai(g);
+    });
+    player.on('error', (e) => {
+      console.error('Lỗi phát nhạc:', e.message);
+      g.textCh.send(`❌ Lỗi khi phát: ${cat(e.message, 150)}`).catch(() => {});
+    });
+  }
+  g.conn = conn; g.vcId = vc.id; g.textCh = textCh;
+  conn.subscribe(g.player);
+  if (!conn.__nhac) {
+    conn.__nhac = true;
+    conn.on(VoiceConnectionStatus.Disconnected, async () => {
+      try { // bị di chuyển kênh thì tự kết nối lại, còn bị đá thì rời hẳn
+        await Promise.race([entersState(conn, VoiceConnectionStatus.Signalling, 5000), entersState(conn, VoiceConnectionStatus.Connecting, 5000)]);
+      } catch { roiKenh(guild.id); }
+    });
+  }
+  return g;
+}
+
+async function phatBai(g) {
+  if (g.dangMo) return;
+  clearTimeout(g.leaveTimer);
+  const t = g.queue.shift();
+  if (!t) { g.cur = null; g.resource = null; datRoi(g); return; }
+  g.dangMo = true; g.cur = t;
+  try {
+    const { resource, proc } = await taoNguon(t);
+    g.proc = proc;
+    resource.volume.setVolume(g.vol / 100);
+    g.resource = resource;
+    g.player.play(resource);
+    g.textCh.send({ embeds: [embedDangPhat(t, g)] }).catch(() => {});
+  } catch (e) {
+    g.textCh.send(`❌ Không phát được **${t.title}**: ${cat(e.message, 150)}`).catch(() => {});
+    g.cur = null; g.dangMo = false;
+    return phatBai(g);
+  }
+  g.dangMo = false;
+}
+
+async function themVaPhat(guild, vc, textCh, tracks, nguoi) {
+  const g = await vaoKenh(guild, vc, textCh);
+  tracks.forEach((t) => { t.by = nguoi; });
+  const phatNgay = !g.cur && !g.dangMo && g.queue.length === 0;
+  g.queue.push(...tracks);
+  if (phatNgay) phatBai(g);
+  return { g, phatNgay };
+}
+
+// ---------- Xử lý lệnh ----------
+function kenhCuaNguoi(i) {
+  const vc = i.member && i.member.voice && i.member.voice.channel;
+  if (!vc) { loiRieng(i, 'Bạn cần vào một kênh voice trước đã.'); return null; }
+  const quyen = vc.permissionsFor(i.guild.members.me);
+  if (!quyen || !quyen.has(PermissionsBitField.Flags.Connect) || !quyen.has(PermissionsBitField.Flags.Speak)) {
+    loiRieng(i, 'Bot không có quyền **Connect** và **Speak** trong kênh voice đó.');
+    return null;
+  }
+  return vc;
+}
+
+async function xuLyNhac(i) {
+  if (!Voice) return loiRieng(i, 'Máy chủ chưa cài thư viện nhạc (`@discordjs/voice`). Hãy chạy `npm install`.');
+  if (!i.guildId) return loiRieng(i, 'Lệnh này chỉ dùng được trong server.');
+  const g = musik.get(i.guildId);
+  switch (i.commandName) {
+    case 'playmusic': case 'pm': {
+      const vc = kenhCuaNguoi(i);
+      if (!vc) return;
+      await i.deferReply();
+      try {
+        const tracks = await giaiDauVao(i.options.getString('link', true));
+        const { g: gg, phatNgay } = await themVaPhat(i.guild, vc, i.channel, tracks, i.user);
+        const t0 = tracks[0];
+        const mo = tracks.length > 1
+          ? `✅ Đã thêm **${tracks.length}** bài vào hàng chờ.`
+          : phatNgay ? `✅ Đang chuẩn bị phát **${t0.title}**…` : `✅ Đã thêm **${t0.title}** vào hàng chờ (vị trí #${gg.queue.length}).`;
+        await i.editReply({ embeds: [new EmbedBuilder().setColor(MAU.thang).setDescription(mo)] });
+      } catch (e) { await suaLoi(i, cat(e.message, 300)); }
+      return;
+    }
+    case 'join': {
+      const vc = kenhCuaNguoi(i);
+      if (!vc) return;
+      await i.deferReply();
+      try {
+        await vaoKenh(i.guild, vc, i.channel);
+        await i.editReply({ embeds: [new EmbedBuilder().setColor(MAU.thang).setDescription(`✅ Đã vào kênh **${vc.name}**. Dùng \`/playmusic\` để phát nhạc!`)] });
+      } catch (e) { await suaLoi(i, e.message); }
+      return;
+    }
+    case 'out': {
+      if (!g) return loiRieng(i, 'Bot đang không ở trong kênh voice nào.');
+      roiKenh(i.guildId);
+      return i.reply({ embeds: [new EmbedBuilder().setColor(MAU.xam).setDescription('👋 Đã rời kênh voice và xóa hàng chờ.')] });
+    }
+    case 'volume': {
+      if (!g) return loiRieng(i, 'Bot đang không ở trong kênh voice nào. Dùng `/join` hoặc `/playmusic` trước.');
+      const v = Math.max(0, Math.min(200, i.options.getInteger('volume', true)));
+      g.vol = v;
+      if (g.resource && g.resource.volume) g.resource.volume.setVolume(v / 100);
+      return i.reply({ embeds: [new EmbedBuilder().setColor(MAU.vang).setDescription(`🔊 Âm lượng: **${v}%**${v > 100 ? ' (trên 100% có thể bị rè)' : ''}`)] });
+    }
+    case 'stop': {
+      if (!g || !g.cur) return loiRieng(i, 'Không có bài nào đang phát.');
+      g.player.pause();
+      return i.reply({ embeds: [new EmbedBuilder().setColor(MAU.vang).setDescription(`⏸️ Đã tạm dừng **${g.cur.title}**. Dùng \`/resume\` để tiếp tục.`)] });
+    }
+    case 'resume': {
+      if (!g || !g.cur) return loiRieng(i, 'Không có bài nào đang tạm dừng.');
+      g.player.unpause();
+      return i.reply({ embeds: [new EmbedBuilder().setColor(MAU.thang).setDescription(`▶️ Tiếp tục phát **${g.cur.title}**.`)] });
+    }
+    case 'skip': {
+      if (!g || !g.cur) return loiRieng(i, 'Không có bài nào để bỏ qua.');
+      const ten = g.cur.title;
+      g.player.stop(true); // trạng thái Idle sẽ tự chuyển sang bài kế tiếp
+      return i.reply({ embeds: [new EmbedBuilder().setColor(MAU.xanh).setDescription(`⏭️ Đã bỏ qua **${ten}**.${g.queue.length ? '' : ' Hàng chờ đã hết.'}`)] });
+    }
+    case 'search': return lenhSearch(i);
+  }
+}
+
+// ---------- /search: 10 bài từ Spotify + SoundCloud, chọn bằng menu ----------
+const timCache = new Map(); // userId -> {ds, t}
+async function lenhSearch(i) {
+  const q = i.options.getString('tukhoa', true).trim();
+  await i.deferReply({ flags: MessageFlags.Ephemeral });
+  const coSp = !!(SPOTIFY_ID && SPOTIFY_SECRET);
+  const [r1, r2] = await Promise.allSettled([coSp ? spTimKiem(q, 5) : Promise.resolve([]), timKiemSC(q, coSp ? 5 : 10)]);
+  const sp = r1.status === 'fulfilled' ? r1.value : [];
+  const sc = r2.status === 'fulfilled' ? r2.value : [];
+  const ds = [...sp, ...sc].slice(0, 10);
+  if (!ds.length) {
+    const lyDo = r2.status === 'rejected' ? r2.reason.message : 'Không có kết quả.';
+    return suaLoi(i, `Không tìm thấy bài nào cho "${cat(q, 50)}". ${cat(lyDo, 150)}`);
+  }
+  timCache.set(i.user.id, { ds, t: Date.now() });
+  const dong = ds.map((t, k) => `**${k + 1}.** ${t.src === 'spotify' ? '🟢' : '☁️'} **${cat(t.title, 60)}** — ${cat(t.artist || '—', 40)} • ${fmtDur(t.dur)}`).join('\n');
+  const embed = new EmbedBuilder()
+    .setColor(MAU.chinh)
+    .setTitle(`🔎 Kết quả cho "${cat(q, 60)}"`)
+    .setDescription(dong)
+    .setFooter({ text: coSp ? '🟢 Spotify • ☁️ SoundCloud — chọn bài ở menu bên dưới (bạn cần đang ở kênh voice)'
+      : '☁️ SoundCloud — chưa cấu hình Spotify nên hiện 10 kết quả SoundCloud. Chọn bài ở menu bên dưới.' });
+  const menu = new StringSelectMenuBuilder()
+    .setCustomId('sr:pick')
+    .setPlaceholder('Chọn bài để phát')
+    .addOptions(ds.map((t, k) => ({ label: cat(`${k + 1}. ${t.title}`, 100), description: cat(t.artist || 'Không rõ', 100), value: String(k) })));
+  await i.editReply({ embeds: [embed], components: [new ActionRowBuilder().addComponents(menu)] });
+}
+async function lenhChon(i) {
+  if (!Voice) return;
+  const c = timCache.get(i.user.id);
+  if (!c || Date.now() - c.t > 10 * 60 * 1000) {
+    return i.update({ content: '⌛ Kết quả tìm kiếm đã hết hạn, hãy dùng lại `/search`.', embeds: [], components: [] }).catch(() => {});
+  }
+  const vc = i.member && i.member.voice && i.member.voice.channel;
+  if (!vc) return i.reply({ content: '❌ Bạn cần vào một kênh voice trước đã.', flags: MessageFlags.Ephemeral }).catch(() => {});
+  const t = { ...c.ds[parseInt(i.values[0], 10)] };
+  await i.update({ content: `✅ Đã chọn **${t.title}**`, embeds: [], components: [] }).catch(() => {});
+  try {
+    const { g, phatNgay } = await themVaPhat(i.guild, vc, i.channel, [t], i.user);
+    if (!phatNgay) i.channel.send({ embeds: [new EmbedBuilder().setColor(MAU.thang).setDescription(`✅ ${i.user} đã thêm **${t.title}** vào hàng chờ (vị trí #${g.queue.length}).`)] }).catch(() => {});
+  } catch (e) {
+    i.followUp({ content: `❌ ${cat(e.message, 200)}`, flags: MessageFlags.Ephemeral }).catch(() => {});
+  }
+}
+
+
 // ===================== KHỞI ĐỘNG BOT =====================
 // Chạy 1 lần khi bot online (nghe cả 'clientReady' và 'ready' để tương thích mọi bản discord.js 14)
 let daKhoiDong = false;
@@ -2419,9 +2860,7 @@ async function khiOnline() {
   console.log(`Bot đã online: ${client.user.tag}`);
   try {
     // Đăng ký slash command (có thể mất vài phút để hiện lần đầu)
-    await client.application.commands.set([
-      { name: 'game2d', description: 'Chọn game: trồng cây multiplayer hoặc rắn ăn táo (chỉ mình bạn nhìn thấy)' },
-    ]);
+    await client.application.commands.set(LENH_SLASH);
   } catch (e) {
     console.error('Không đăng ký được slash command (hãy mời lại bot với scope applications.commands):', e);
   }
@@ -2431,7 +2870,11 @@ client.once('ready', khiOnline);
 
 client.on('interactionCreate', async (i) => {
   try {
-    if (i.isChatInputCommand() && i.commandName === 'game2d') return await hienMenuLenh(i);
+    if (i.isChatInputCommand()) {
+      if (i.commandName === 'game2d') return await hienMenuLenh(i);
+      if (LENH_NHAC.has(i.commandName)) return await xuLyNhac(i);
+    }
+    if (i.isStringSelectMenu() && i.customId === 'sr:pick') return await lenhChon(i);
     if (i.isButton()) {
       if (i.customId.startsWith('g2:')) return await xuLyNutGame(i);
       if (i.customId.startsWith('sn:')) return await xuLyNutSnake(i);
