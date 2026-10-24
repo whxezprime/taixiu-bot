@@ -541,7 +541,11 @@ lenh.set('helptx', (m) => {
       },
       {
         name: '🌱 Game trồng cây',
-        value: '`/game2d` — game trồng cây 2D multiplayer: mỗi người 1 vườn 8 ô, trồng – tưới – thu hoạch – bán (dùng chung tiền với bot). Khung chơi chỉ mình bạn thấy.',
+        value: '`/game2d` — chọn **🌱 trồng cây** (multiplayer, mỗi người 1 vườn 8 ô) hoặc **🐍 rắn ăn táo** (20 màn, thắng mỗi màn +100 vnđ). Khung chơi chỉ mình bạn thấy.',
+      },
+      {
+        name: '📈 Trader (giá Coin đổi mỗi 30 giây)',
+        value: '`!gia` — xem giá & biểu đồ\n`!buy <số lượng|all>` — mua coin\n`!sell <số lượng|all>` — bán coin',
       },
       {
         name: '🃏 Bài 3 cây (2–4 người)',
@@ -592,6 +596,7 @@ lenh.set('hoso', (m) => {
       { name: '🏆 Thắng', value: `**${u.stats.thang}**`, inline: true },
       { name: '💔 Thua', value: `**${u.stats.thua}**`, inline: true },
       { name: '💎 Thắng lớn nhất', value: fmt(u.stats.lonNhat), inline: true },
+      { name: '🪙 Coin đang giữ', value: `**${u.coin || 0}**`, inline: true },
       {
         name: '📅 Điểm danh',
         value: `${daDiemDanh ? '✅ Hôm nay đã điểm danh' : '⏳ Hôm nay chưa điểm danh'}\n🔥 Chuỗi: **${u.streak}** ngày`,
@@ -1519,7 +1524,7 @@ function veGame(sess, u, edit) {
         nut('act', 'Tương tác', '✋', ButtonStyle.Primary)),
       hang(nut('water', 'Tưới', '💧'), nut('dig', 'Xẻng', '⛏️'), nut('bag', 'Túi', '🎒'),
         nut('home', null, '🏠'), nut('refresh', null, '🔄')),
-      hang(nut('step', `Bước x${s.step}`, '🏃'), nut('quit', null, '✖️', ButtonStyle.Danger)),
+      hang(nut('step', `Bước x${s.step}`, '🏃'), nut('menu', 'Menu', '📋'), nut('quit', null, '✖️', ButtonStyle.Danger)),
     ];
   } else if (s.mode === 'shop_seed') {
     const ds = Object.keys(SEEDS).map((k) => {
@@ -1587,13 +1592,13 @@ function datHetHan(sess) {
 
 async function khoiDongGame(i) {
   const uid = i.user.id;
-  const rieng = { flags: MessageFlags.Ephemeral };
-  if (!i.guildId) return i.reply({ content: '❌ Lệnh này chỉ dùng được trong server.', ...rieng });
   const u = getUser(uid);
-  if (!u) return i.reply({ content: '❌ Bạn cần dùng `!dangky` trước khi chơi.', ...rieng });
+  if (!u || !i.guildId) return;
 
   const cu = gameSessions.get(uid);
   if (cu) ketThucPhien(cu, true);
+  const cs = snakeSessions.get(uid);
+  if (cs) ketThucSnake(cs, false);
 
   const f = getFarm(u);
   f.name = (i.member && i.member.displayName) || i.user.displayName || i.user.username;
@@ -1612,7 +1617,7 @@ async function khoiDongGame(i) {
   };
   gameSessions.set(uid, sess);
   datHetHan(sess);
-  await i.reply({ ...veGame(sess, u, false), ...rieng });
+  await i.update(veGame(sess, u, true)); // thay menu chọn game bằng khung chơi
 }
 
 async function xuLyNutGame(i) {
@@ -1630,6 +1635,7 @@ async function xuLyNutGame(i) {
     sess.last = i;
     datHetHan(sess);
     const [, act, arg] = i.customId.split(':');
+    if (act === 'menu') { ketThucPhien(sess, false); return await i.update(menuPayload()); }
     xuLyGame(u, sess, act, arg);
     await i.update(veGame(sess, u, true));
     if (sess.s.mode === 'end') ketThucPhien(sess, false);
@@ -1662,6 +1668,748 @@ setInterval(async () => {
 lenh.set('game2d', (m) => loi(m, 'Game này đã chuyển sang slash command, hãy gõ **/game2d**.'));
 
 
+// ===================== RẮN ĂN TÁO (chọn trong /game2d) =====================
+// Rắn có trọng lực: ăn hết táo để mở hố đen, rồi chui vào hố đen để qua màn.
+// Rắn mất điểm tựa sẽ rơi xuống; đi nước khiến rắn rơi khỏi bản đồ sẽ bị chặn.
+const SN_THUONG = 100;               // tiền thưởng mỗi màn
+const SN_CHI_THUONG_LAN_DAU = true;  // true: chỉ thưởng lần thắng đầu tiên của mỗi màn (chống cày tiền)
+
+// ---------- Động cơ rắn có trọng lực ----------
+const SN_W = 14, SN_H = 10;
+const SN_DIRS = { up: [0, -1], down: [0, 1], left: [-1, 0], right: [1, 0] };
+
+// rows: mảng 10 chuỗi dài 14. # tường • . trống • A táo • E hố đen • H đầu rắn • 1-9 thân (theo thứ tự)
+function snTaoLevel(rows) {
+  const W = SN_W, H = SN_H;
+  const solid = new Uint8Array(W * H), appleAt = new Int8Array(W * H).fill(-1);
+  let exit = -1, nA = 0;
+  const seg = [];
+  for (let y = 0; y < H; y++) {
+    for (let x = 0; x < W; x++) {
+      const ch = rows[y][x], i = y * W + x;
+      if (ch === '#') solid[i] = 1;
+      else if (ch === 'A') appleAt[i] = nA++;
+      else if (ch === 'E') exit = i;
+      else if (ch === 'H') seg[0] = i;
+      else if (ch >= '1' && ch <= '9') seg[+ch] = i;
+    }
+  }
+  return { W, H, solid, appleAt, nA, exit, start: { s: seg, m: (1 << nA) - 1 } };
+}
+
+// Có điểm tựa không? (tường, táo chưa ăn, hố đen còn đóng đều là chỗ tựa; thân rắn thì không)
+function snDaTua(L, s, m) {
+  for (const c of s) {
+    if (((c / L.W) | 0) + 1 >= L.H) continue;
+    const b = c + L.W;
+    if (L.solid[b]) return true;
+    if (b === L.exit && m !== 0) return true;
+    const ai = L.appleAt[b];
+    if (ai >= 0 && ((m >> ai) & 1)) return true;
+  }
+  return false;
+}
+
+// Áp dụng trọng lực. Trả về {s, win} hoặc null nếu rơi khỏi bản đồ.
+function snTrongLuc(L, s, m) {
+  while (!snDaTua(L, s, m)) {
+    if (s.some((c) => ((c / L.W) | 0) + 1 >= L.H)) return null;
+    s = s.map((c) => c + L.W);
+    if (m === 0 && s[0] === L.exit) return { s, win: true };
+  }
+  return { s, win: false };
+}
+
+// Đi 1 bước. Trả về null nếu không đi được, ngược lại {st:{s,m}, win, an}
+function snBuocDi(L, st, d) {
+  const [dx, dy] = SN_DIRS[d];
+  const h = st.s[0], hx = h % L.W, hy = (h / L.W) | 0;
+  const nx = hx + dx, ny = hy + dy;
+  if (nx < 0 || nx >= L.W || ny < 0 || ny >= L.H) return null;
+  const n = ny * L.W + nx;
+  if (L.solid[n]) return null;
+  if (n === L.exit) {
+    if (st.m !== 0) return null;
+    return { st: { s: [n, ...st.s.slice(0, -1)], m: st.m }, win: true, an: false };
+  }
+  if (st.s.includes(n)) return null;
+  const ai = L.appleAt[n];
+  const an = ai >= 0 && ((st.m >> ai) & 1) === 1;
+  let s = an ? [n, ...st.s] : [n, ...st.s.slice(0, -1)];
+  const m = an ? st.m & ~(1 << ai) : st.m;
+  const g = snTrongLuc(L, s, m);
+  if (!g) return null; // sẽ rơi khỏi bản đồ -> không cho đi
+  return { st: { s: g.s, m }, win: g.win, an };
+}
+
+
+
+const SN_LEVELS = [
+  { par: 7, rows: [
+    '..............',
+    '..............',
+    '..............',
+    '..............',
+    'E#######......',
+    '..A...H123....',
+    '..######......',
+    '..............',
+    '..............',
+    '..............',
+  ] },
+  { par: 9, rows: [
+    '..............',
+    '..............',
+    '......######E.',
+    '......######..',
+    '......######..',
+    '....21H...A...',
+    '.....#######..',
+    '.......#####..',
+    '..##########..',
+    '..............',
+  ] },
+  { par: 12, rows: [
+    '..............',
+    '..............',
+    '......######..',
+    '......E......H',
+    '.......A####.1',
+    '.......#####.2',
+    '.......#####.3',
+    '.......#######',
+    '..............',
+    '..............',
+  ] },
+  { par: 13, rows: [
+    '..............',
+    '..............',
+    '...####.......',
+    '...####...##..',
+    '.......A..#...',
+    '....####..#...',
+    '.H12####..#...',
+    '..######E.#...',
+    '........#####.',
+    '..............',
+  ] },
+  { par: 14, rows: [
+    '..............',
+    '..............',
+    '.#######......',
+    'E#######......',
+    'A#######......',
+    '.....A........',
+    '....###21H....',
+    '..#######.....',
+    '..#######.....',
+    '..............',
+  ] },
+  { par: 16, rows: [
+    '..............',
+    '.......H12....',
+    '...#######....',
+    '...#######....',
+    '.....###E#....',
+    '...A....A#....',
+    '...#######....',
+    '..########....',
+    '..######.#....',
+    '..............',
+  ] },
+  { par: 20, rows: [
+    '..............',
+    '..............',
+    '..............',
+    '......E.......',
+    '#######.......',
+    '.######.......',
+    '...A.21H......',
+    '...A.#####....',
+    '...#######....',
+    '..............',
+  ] },
+  { par: 20, rows: [
+    '..............',
+    '..............',
+    '..###.........',
+    '..###EA.......',
+    '...A..#.......',
+    '......#.......',
+    '.....21H.###..',
+    '...#########..',
+    '...#######....',
+    '..............',
+  ] },
+  { par: 24, rows: [
+    '..............',
+    '..............',
+    '..............',
+    '.....H1234....',
+    '......######..',
+    '.A...A######..',
+    '#####.######..',
+    '#####..#####..',
+    '...........E..',
+    '..............',
+  ] },
+  { par: 25, rows: [
+    '..............',
+    '..............',
+    '........4321H.',
+    '.....A.....#..',
+    '....######.#..',
+    '...#######A...',
+    '##.######.....',
+    '##.######.....',
+    '##...E.....###',
+    '..............',
+  ] },
+  { par: 27, rows: [
+    '...H..........',
+    '...1......A...',
+    '...2....A##...',
+    '...3.########.',
+    '.#.4A#######..',
+    '.#.#########..',
+    '.#.#########..',
+    '...######.....',
+    '.....E........',
+    '..............',
+  ] },
+  { par: 30, rows: [
+    '..............',
+    '..............',
+    '..H...A.......',
+    '..1.A#######A.',
+    '..2..#######..',
+    '..3..#########',
+    '..4.E.##......',
+    '..#######.....',
+    '..#######.....',
+    '..............',
+  ] },
+  { par: 32, rows: [
+    '..............',
+    '..........H...',
+    '....E.....1...',
+    '...#######2...',
+    '.....A...A3...',
+    '..........4...',
+    '.......####A..',
+    '........###...',
+    '..............',
+    '..............',
+  ] },
+  { par: 34, rows: [
+    '..............',
+    '..............',
+    '....H1234..A..',
+    '.A###A..######',
+    '..###...######',
+    '........#.....',
+    '........######',
+    '.....##.######',
+    '.....##.#...##',
+    '........E.....',
+  ] },
+  { par: 38, rows: [
+    '..............',
+    '..............',
+    '..............',
+    '..............',
+    '..............',
+    '.H1234.EA.....',
+    '..A#######....',
+    '...#######A...',
+    '...##########.',
+    '..............',
+  ] },
+  { par: 40, rows: [
+    '..............',
+    '..............',
+    '......A.......',
+    '......#######.',
+    '...4321H....A.',
+    '.######A......',
+    '..E.#.........',
+    '..#######.....',
+    '....#.........',
+    '..............',
+  ] },
+  { par: 45, rows: [
+    '..............',
+    '....A.........',
+    '.#######E.....',
+    '..............',
+    '..............',
+    '4321H..#A.....',
+    '..A######.....',
+    '...######.....',
+    '..............',
+    '..............',
+  ] },
+  { par: 49, rows: [
+    '..............',
+    '..............',
+    '..............',
+    '..............',
+    '....4321H####.',
+    '...A#########.',
+    '..........A...',
+    '........###A..',
+    '........######',
+    '...........E..',
+  ] },
+  { par: 51, rows: [
+    '..............',
+    '..............',
+    '..###.........',
+    '..###.........',
+    '..#########...',
+    '..##########..',
+    '.A##......##E.',
+    '.A.4321H.A##..',
+    '.######.......',
+    '..............',
+  ] },
+  { par: 56, rows: [
+    '..............',
+    '..............',
+    '....A..H1234..',
+    'A#######......',
+    '.#######......',
+    '........###A..',
+    '...#....###...',
+    '...#....###...',
+    '...######.....',
+    '.....E........',
+  ] },
+];
+
+const SN_LV = SN_LEVELS.map((l) => snTaoLevel(l.rows));
+
+const snTienDo = (u) => {
+  if (!u.snake) u.snake = { done: [] };
+  if (!Array.isArray(u.snake.done)) u.snake.done = [];
+  return u.snake;
+};
+// Màn cao nhất được chơi (chơi xong màn n thì mở màn n+1)
+const snMoKhoa = (u) => {
+  const d = snTienDo(u).done;
+  return Math.min(SN_LEVELS.length - 1, d.length ? Math.max(...d) + 1 : 0);
+};
+const snManDauTien = (u) => {
+  const d = snTienDo(u).done;
+  for (let k = 0; k < SN_LEVELS.length; k++) if (!d.includes(k)) return k;
+  return 0;
+};
+
+// ---------- Vẽ màn chơi ----------
+Object.assign(FONT, { 0: ['111', '101', '101', '101', '111'], 9: ['111', '101', '111', '001', '111'] });
+function snChu(cv, x, y, str, sc, c) {
+  [...str].forEach((ch, idx) => {
+    const g = FONT[ch];
+    if (!g) return;
+    for (let r = 0; r < 5; r++) for (let k = 0; k < 3; k++) {
+      if (g[r][k] === '1') rect(cv, x + (idx * 4 + k) * sc, y + r * sc, sc, sc, c);
+    }
+  });
+}
+function snNen(cv) {
+  const H = cv.h;
+  for (let y = 0; y < H; y++) {
+    const t = y / H;
+    const r = Math.round(0x5a + (0xcf - 0x5a) * t), g = Math.round(0xa9 + (0xe8 - 0xa9) * t), b = Math.round(0xea + (0xfb - 0xea) * t);
+    rect(cv, 0, y, cv.w, 1, (r << 16) | (g << 8) | b);
+  }
+  // mây
+  for (const [cx, cy, w] of [[20, 90, 46], [120, 60, 38], [170, 100, 50], [70, 120, 36]]) {
+    rect(cv, cx, cy, w, 8, 0xeaf6ff); rect(cv, cx + 6, cy - 6, w - 14, 7, 0xeaf6ff); rect(cv, cx + 12, cy - 10, w - 28, 5, 0xeaf6ff);
+  }
+  // đồi cỏ phía dưới
+  for (let x = 0; x < cv.w; x++) {
+    const h1 = 8 * TS + 6 + Math.round(Math.sin(x / 14) * 4 + Math.sin(x / 5) * 1.5);
+    rect(cv, x, h1, 1, cv.h - h1, 0x6cc04a);
+    const h2 = 8 * TS + 22 + Math.round(Math.sin(x / 11 + 2) * 3);
+    rect(cv, x, h2, 1, cv.h - h2, 0x58a83c);
+  }
+}
+function snGo(cv, ox, oy, wx, wy, L) {
+  const co = (x, y) => x >= 0 && y >= 0 && x < L.W && y < L.H && L.solid[y * L.W + x] === 1;
+  rect(cv, ox, oy, TS, TS, 0x6e3b1b);
+  for (let y = 3; y < TS; y += 4) {
+    const off = hashXY(wx * 3 + y, wy * 7) % 9;
+    rect(cv, ox + off, oy + y, Math.min(6 + (hashXY(wx, wy + y) % 5), TS - 1 - off), 1, 0x5a2f15);
+  }
+  if (!co(wx, wy - 1)) { rect(cv, ox, oy, TS, 3, 0x9c6a3a); rect(cv, ox, oy + 3, TS, 1, 0x7d4f27); }
+  if (!co(wx - 1, wy)) rect(cv, ox, oy, 2, TS, 0x85502a);
+  const vien = 0x2b1507;
+  if (!co(wx, wy - 1)) rect(cv, ox, oy, TS, 1, vien);
+  if (!co(wx, wy + 1)) rect(cv, ox, oy + TS - 1, TS, 1, vien);
+  if (!co(wx - 1, wy)) rect(cv, ox, oy, 1, TS, vien);
+  if (!co(wx + 1, wy)) rect(cv, ox + TS - 1, oy, 1, TS, vien);
+}
+function snTao(cv, ox, oy) {
+  for (let dy = -6; dy <= 6; dy++) for (let dx = -6; dx <= 6; dx++) {
+    if (dx * dx + dy * dy <= 30) px(cv, ox + 8 + dx, oy + 9 + dy, dx * dx + dy * dy > 24 ? 0x8e1c1c : 0xe53935);
+  }
+  rect(cv, ox + 5, oy + 6, 2, 2, 0xff8a80);
+  rect(cv, ox + 8, oy + 2, 1, 3, 0x5d4037);
+  rect(cv, ox + 9, oy + 2, 3, 2, 0x43a047);
+}
+function snHo(cv, ox, oy, mo) {
+  const c1 = mo ? 0x0b0b0b : 0x6a6a6a, c2 = mo ? 0x3b3b3b : 0x9a9a9a;
+  for (let dy = -7; dy <= 7; dy++) for (let dx = -7; dx <= 7; dx++) {
+    const d = Math.sqrt(dx * dx + dy * dy);
+    if (d > 7.2) continue;
+    const v = Math.floor(d * 0.9 + Math.atan2(dy, dx) * 1.3 + 20) & 1;
+    px(cv, ox + 8 + dx, oy + 8 + dy, d > 6.3 ? 0x1c1c1c : v ? c2 : c1);
+  }
+}
+function snRan(cv, st, L, dir) {
+  const ct = (c) => [(c % L.W) * TS + 8, ((c / L.W) | 0) * TS + 8];
+  const dai = (pass) => {
+    const hl = pass === 0 ? 7 : 6;
+    const mau = pass === 0 ? 0x14532d : null;
+    st.s.forEach((c, i) => {
+      const [cx, cy] = ct(c);
+      const fill = mau !== null ? mau : (i % 2 ? 0x2fa845 : 0x3cc254);
+      rect(cv, cx - hl, cy - hl, hl * 2, hl * 2, fill);
+      if (i + 1 < st.s.length) {
+        const [nx, ny] = ct(st.s[i + 1]);
+        const x0 = Math.min(cx, nx) - hl, y0 = Math.min(cy, ny) - hl;
+        rect(cv, x0, y0, Math.abs(cx - nx) + hl * 2, Math.abs(cy - ny) + hl * 2, fill);
+      }
+    });
+  };
+  dai(0); dai(1);
+  st.s.forEach((c, i) => { // vệt sáng
+    const [cx, cy] = ct(c);
+    rect(cv, cx - 4, cy - 4, 2, 6, 0x7ee38f);
+  });
+  // đầu: mũ tím + mắt
+  const [hx, hy] = ct(st.s[0]);
+  const ox = hx - 8, oy = hy - 8;
+  rect(cv, ox + 2, oy + 1, 12, 3, 0x9c27b0); rect(cv, ox + 3, oy, 10, 1, 0x9c27b0); rect(cv, ox + 10, oy, 4, 2, 0xe91e63);
+  const [dx, dy] = SN_DIRS[dir] || SN_DIRS.right;
+  for (const ex of [ox + 3 + dx, ox + 9 + dx]) {
+    rect(cv, ex, oy + 5 + dy, 4, 4, 0xffffff);
+    rect(cv, ex + 1 + dx, oy + 6 + dy + (dy > 0 ? 1 : 0), 2, 2, 0x111111);
+  }
+}
+function snVe(sess) {
+  const L = sess.L;
+  const cv = mkCanvas(L.W * TS, L.H * TS);
+  snNen(cv);
+  for (let y = 0; y < L.H; y++) for (let x = 0; x < L.W; x++) {
+    const i = y * L.W + x, ox = x * TS, oy = y * TS;
+    if (L.solid[i]) snGo(cv, ox, oy, x, y, L);
+    else if (i === L.exit) snHo(cv, ox, oy, sess.st.m === 0);
+    else if (L.appleAt[i] >= 0 && ((sess.st.m >> L.appleAt[i]) & 1)) snTao(cv, ox, oy);
+  }
+  snRan(cv, sess.st, L, sess.dir);
+  const so2 = String(sess.lv + 1).padStart(2, '0');
+  snChu(cv, 9, L.H * TS - 15, so2, 2, 0x1b2a3a);
+  snChu(cv, 8, L.H * TS - 16, so2, 2, 0xffffff);
+  return ghiPNG(cv, SC);
+}
+
+// ---------- Phiên chơi ----------
+const snakeSessions = new Map(); // userId -> phiên
+
+function snBatDau(sess, lv) {
+  sess.lv = lv;
+  sess.L = SN_LV[lv];
+  sess.st = { s: sess.L.start.s.slice(), m: sess.L.start.m };
+  sess.hist = [];
+  sess.moves = 0;
+  sess.dir = 'right';
+  sess.mode = 'play';
+  sess.thuong = 0;
+}
+
+function snXuLy(u, sess, act) {
+  sess.msg = '';
+  const mo = snMoKhoa(u);
+  switch (act) {
+    case 'up': case 'down': case 'left': case 'right': {
+      if (sess.mode !== 'play') break;
+      const r = snBuocDi(sess.L, sess.st, act);
+      if (!r) { sess.msg = '🚫 Không đi được hướng này (có vật cản, đụng thân, hố đen còn đóng hoặc sẽ rơi khỏi bản đồ).'; break; }
+      sess.hist.push({ st: sess.st, moves: sess.moves, dir: sess.dir });
+      if (sess.hist.length > 400) sess.hist.shift();
+      sess.st = r.st; sess.moves++; sess.dir = act;
+      if (r.an) sess.msg = '🍎 Ngon quá! Rắn dài thêm 1 đốt.';
+      if (r.win) {
+        sess.mode = 'win';
+        const sn = snTienDo(u);
+        const lanDau = !sn.done.includes(sess.lv);
+        if (lanDau) sn.done.push(sess.lv);
+        if (lanDau || !SN_CHI_THUONG_LAN_DAU) { u.balance += SN_THUONG; sess.thuong = SN_THUONG; }
+        save();
+      }
+      break;
+    }
+    case 'undo': {
+      if (sess.mode !== 'play' || !sess.hist.length) break;
+      const h = sess.hist.pop();
+      sess.st = h.st; sess.moves = h.moves; sess.dir = h.dir;
+      break;
+    }
+    case 'reset': snBatDau(sess, sess.lv); sess.msg = '🔄 Đã làm lại màn này.'; break;
+    case 'prev': if (sess.lv > 0) snBatDau(sess, sess.lv - 1); break;
+    case 'next':
+      if (sess.lv < mo) snBatDau(sess, sess.lv + 1);
+      else sess.msg = '🔒 Hãy hoàn thành màn này trước.';
+      break;
+    case 'continue':
+      if (sess.lv + 1 < SN_LEVELS.length) snBatDau(sess, sess.lv + 1);
+      break;
+  }
+}
+
+function snVeGame(sess, u, edit) {
+  const user = sess.user;
+  const ten = `sn_${Date.now()}.png`;
+  const file = new AttachmentBuilder(snVe(sess), { name: ten });
+  const mo = snMoKhoa(u);
+  const par = SN_LEVELS[sess.lv].par;
+  const conLai = (() => { let n = 0, m = sess.st.m; while (m) { n += m & 1; m >>= 1; } return n; })();
+  const xong = snTienDo(u).done.length;
+  const embed = khung(user, sess.mode === 'win' ? MAU.vang : MAU.thang, `🐍 RẮN ĂN TÁO — Màn ${sess.lv + 1}/${SN_LEVELS.length}`)
+    .setImage(`attachment://${ten}`);
+  let rows;
+  if (sess.mode === 'win') {
+    const het = xong >= SN_LEVELS.length;
+    embed.setDescription(
+      `🎉 **Hoàn thành màn ${sess.lv + 1}** trong **${sess.moves}** bước (tối ưu: ${par})!\n` +
+      (sess.thuong ? `🎁 Thưởng **+${fmt(sess.thuong)}**` : '*Màn này bạn đã nhận thưởng rồi.*') +
+      (het ? '\n\n🏆 Bạn đã hoàn thành cả 20 màn!' : '')
+    ).addFields({ name: '💰 Số dư', value: `**${fmt(u.balance)}**`, inline: true });
+    rows = [hang(
+      nut('continue', 'Màn tiếp', '▶️', ButtonStyle.Success, sess.lv + 1 >= SN_LEVELS.length),
+      nut('reset', 'Chơi lại', '🔄'),
+      nut('menu', 'Menu', '📋'))];
+  } else {
+    embed.setDescription(
+      sess.msg || 'Ăn hết 🍎 để mở **hố đen**, rồi chui vào hố đen! Rắn sẽ rơi nếu không có chỗ tựa.'
+    ).addFields(
+      { name: '👣 Số bước', value: `**${sess.moves}**`, inline: true },
+      { name: '🍎 Táo còn', value: `**${conLai}**`, inline: true },
+      { name: '⭐ Tối ưu', value: `${par} bước`, inline: true },
+      { name: '🎁 Thưởng', value: snTienDo(u).done.includes(sess.lv) ? 'Đã nhận' : `+${fmt(SN_THUONG)}`, inline: true },
+      { name: '📊 Tiến độ', value: `${xong}/${SN_LEVELS.length} màn`, inline: true }
+    );
+    rows = [
+      hang(nut('left', null, '⬅️'), nut('up', null, '⬆️'), nut('down', null, '⬇️'), nut('right', null, '➡️'),
+        nut('undo', 'Hoàn tác', '↩️', ButtonStyle.Primary, !sess.hist.length)),
+      hang(nut('reset', 'Làm lại', '🔄'), nut('prev', null, '⏮️', ButtonStyle.Secondary, sess.lv === 0),
+        nut('next', null, '⏭️', ButtonStyle.Secondary, sess.lv >= mo), nut('menu', 'Menu', '📋')),
+    ];
+  }
+  const payload = { embeds: [embed], components: rows, files: [file] };
+  if (edit) payload.attachments = [];
+  return payload;
+}
+
+function ketThucSnake(sess, xoaNut) {
+  clearTimeout(sess.timer);
+  if (snakeSessions.get(sess.uid) === sess) snakeSessions.delete(sess.uid);
+  if (xoaNut) sess.last.editReply({ components: [] }).catch(() => {});
+}
+function datHetHanSnake(sess) {
+  clearTimeout(sess.timer);
+  sess.timer = setTimeout(() => ketThucSnake(sess, true), GAME_IDLE);
+}
+
+async function khoiDongSnake(i) {
+  const uid = i.user.id;
+  const u = getUser(uid);
+  if (!u) return;
+  const cf = gameSessions.get(uid);
+  if (cf) ketThucPhien(cf, false);
+  const cu = snakeSessions.get(uid);
+  if (cu) ketThucSnake(cu, false);
+  const sess = { uid, user: i.user, last: i, timer: null, msg: '' };
+  snBatDau(sess, snManDauTien(u));
+  snakeSessions.set(uid, sess);
+  datHetHanSnake(sess);
+  await i.update(snVeGame(sess, u, true));
+}
+
+async function xuLyNutSnake(i) {
+  const sess = snakeSessions.get(i.user.id);
+  if (!sess) {
+    return i.update({
+      content: '⌛ Phiên chơi đã hết hạn. Dùng `/game2d` để chơi lại.',
+      embeds: [], components: [], attachments: [],
+    }).catch(() => {});
+  }
+  const u = getUser(i.user.id);
+  if (!u) return;
+  try {
+    sess.last = i;
+    datHetHanSnake(sess);
+    const act = i.customId.split(':')[1];
+    if (act === 'menu') { ketThucSnake(sess, false); return await i.update(menuPayload()); }
+    snXuLy(u, sess, act);
+    await i.update(snVeGame(sess, u, true));
+  } catch (e) {
+    console.error('Lỗi rắn ăn táo:', e);
+  }
+}
+
+// ---------- Menu chọn trò chơi cho /game2d ----------
+function menuPayload() {
+  const embed = new EmbedBuilder()
+    .setColor(MAU.chinh)
+    .setTitle('🎮 CHỌN TRÒ CHƠI')
+    .setDescription('Bạn muốn chơi gì hôm nay?')
+    .addFields(
+      { name: '🌱 Trồng cây', value: 'Game nông trại multiplayer: trồng, tưới, thu hoạch và bán trái cây.' },
+      { name: '🐍 Rắn ăn táo', value: `Game giải đố ${SN_LEVELS.length} màn: ăn táo, chui vào hố đen. Mỗi màn thắng **+${SN_THUONG} vnđ**.` }
+    )
+    .setFooter({ text: 'Bot Tài Xỉu • khung chơi chỉ mình bạn nhìn thấy' });
+  return {
+    embeds: [embed],
+    components: [hang(
+      new ButtonBuilder().setCustomId('gm:farm').setLabel('Trồng cây').setEmoji('🌱').setStyle(ButtonStyle.Success),
+      new ButtonBuilder().setCustomId('gm:snake').setLabel('Rắn ăn táo').setEmoji('🐍').setStyle(ButtonStyle.Primary))],
+    files: [], attachments: [], content: '',
+  };
+}
+async function hienMenuLenh(i) {
+  const rieng = { flags: MessageFlags.Ephemeral };
+  if (!i.guildId) return i.reply({ content: '❌ Lệnh này chỉ dùng được trong server.', ...rieng });
+  if (!getUser(i.user.id)) return i.reply({ content: '❌ Bạn cần dùng `!dangky` trước khi chơi.', ...rieng });
+  const { embeds, components } = menuPayload();
+  await i.reply({ embeds, components, ...rieng });
+}
+async function xuLyMenu(i) {
+  if (!getUser(i.user.id)) return;
+  if (i.customId === 'gm:farm') return khoiDongGame(i);
+  if (i.customId === 'gm:snake') return khoiDongSnake(i);
+}
+
+
+// ===================== TRADER: !gia, !buy, !sell =====================
+// Giá Coin dao động quanh 1000 vnđ, đổi mỗi 30 giây (mean-reverting + nhiễu ngẫu nhiên)
+const TD = {
+  giaTB: 1000,        // giá trung bình
+  chuKy: 30 * 1000,   // giá đổi sau mỗi 30 giây
+  min: 400, max: 2000,
+  keo: 0.1,           // lực kéo giá về mức trung bình mỗi chu kỳ
+  bienDo: 55,         // độ nhiễu mỗi chu kỳ
+  phi: 0.02,          // phí giao dịch mỗi chiều (mua/bán)
+  lichSu: 24,         // số mốc giá lưu để vẽ biểu đồ
+};
+function layTrader() {
+  if (!db.trader) db.trader = { price: TD.giaTB, last: Date.now(), hist: [TD.giaTB] };
+  const t = db.trader;
+  const now = Date.now();
+  const n = Math.floor((now - t.last) / TD.chuKy);
+  if (n > 0) { // cập nhật bù cho thời gian đã trôi qua (kể cả lúc bot tắt)
+    for (let k = 0; k < Math.min(n, 300); k++) {
+      const nhieu = (Math.random() + Math.random() + Math.random() - 1.5) * 2 * TD.bienDo;
+      t.price = Math.round(Math.max(TD.min, Math.min(TD.max, t.price + TD.keo * (TD.giaTB - t.price) + nhieu)));
+      t.hist.push(t.price);
+    }
+    if (t.hist.length > TD.lichSu) t.hist = t.hist.slice(-TD.lichSu);
+    t.last = n > 300 ? now : t.last + n * TD.chuKy;
+    save();
+  }
+  return t;
+}
+function bieuDo(hist) {
+  const khoi = '▁▂▃▄▅▆▇█';
+  const lo = Math.min(...hist), hi = Math.max(...hist);
+  return hist.map((p) => khoi[hi === lo ? 3 : Math.round(((p - lo) / (hi - lo)) * 7)]).join('');
+}
+const giaMua = (price, sl) => Math.ceil(price * sl * (1 + TD.phi));
+const giaBan = (price, sl) => Math.floor(price * sl * (1 - TD.phi));
+
+lenh.set('gia', (m) => {
+  const u = getUser(m.author.id);
+  const t = layTrader();
+  const truoc = t.hist.length > 1 ? t.hist[t.hist.length - 2] : t.price;
+  const doi = t.price - truoc;
+  const pt = truoc ? (doi / truoc) * 100 : 0;
+  const coin = u.coin || 0;
+  const lai = coin ? giaBan(t.price, coin) - (u.coinCost || 0) : 0;
+  const embed = khung(m.author, doi >= 0 ? MAU.thang : MAU.thua, '📈 SÀN TRADER — COIN')
+    .setDescription(
+      `# ${fmt(t.price)}\n${doi >= 0 ? '🟢 ▲' : '🔴 ▼'} ${doi >= 0 ? '+' : ''}${doi} (${pt >= 0 ? '+' : ''}${pt.toFixed(1)}%)\n\n` +
+      `\`${bieuDo(t.hist)}\`\nCao ${fmt(Math.max(...t.hist))} • Thấp ${fmt(Math.min(...t.hist))}`
+    )
+    .addFields(
+      { name: '🪙 Bạn đang giữ', value: `**${coin}** coin`, inline: true },
+      { name: '💼 Giá trị', value: fmt(coin ? giaBan(t.price, coin) : 0), inline: true },
+      { name: lai >= 0 ? '📗 Lãi tạm tính' : '📕 Lỗ tạm tính', value: coin ? `${lai >= 0 ? '+' : '-'}${fmt(Math.abs(lai))}` : '—', inline: true },
+      { name: '⏱️ Giá đổi tiếp', value: `<t:${Math.floor((t.last + TD.chuKy) / 1000)}:R> (mỗi ${TD.chuKy / 1000}s)`, inline: true },
+      { name: 'ℹ️ Lệnh', value: '`!buy <số lượng|all>` • `!sell <số lượng|all>`\nPhí giao dịch ' + Math.round(TD.phi * 100) + '% mỗi chiều.', inline: false }
+    );
+  return reply(m, { embeds: [embed] });
+});
+lenh.set('trader', lenh.get('gia'));
+
+function parseSL(str, toiDa) {
+  if (!str) return { error: 'Bạn chưa nhập số lượng (hoặc `all`).' };
+  if (str.toLowerCase() === 'all') return toiDa > 0 ? { sl: toiDa } : { error: 'Bạn không thể giao dịch lúc này (không đủ tiền / không có coin).' };
+  if (!/^\d+$/.test(str) || parseInt(str, 10) < 1) return { error: 'Số lượng không hợp lệ.' };
+  return { sl: parseInt(str, 10) };
+}
+
+lenh.set('buy', (m, args) => {
+  const u = getUser(m.author.id);
+  const t = layTrader();
+  const toiDa = Math.floor(u.balance / (t.price * (1 + TD.phi)));
+  const r = parseSL(args[0], toiDa);
+  if (r.error) return loi(m, r.error);
+  const cost = giaMua(t.price, r.sl);
+  if (cost > u.balance) return loi(m, `Không đủ tiền: cần ${fmt(cost)} cho ${r.sl} coin (tối đa mua được ${toiDa}).`);
+  u.balance -= cost;
+  u.coin = (u.coin || 0) + r.sl;
+  u.coinCost = (u.coinCost || 0) + cost;
+  save();
+  const embed = khung(m.author, MAU.thang, '🟢 MUA COIN')
+    .addFields(
+      { name: 'Số lượng', value: `**${r.sl}** coin`, inline: true },
+      { name: 'Giá', value: fmt(t.price), inline: true },
+      { name: 'Tổng chi (đã gồm phí)', value: `**-${fmt(cost)}**`, inline: true },
+      { name: '🪙 Đang giữ', value: `${u.coin} coin`, inline: true },
+      { name: '💰 Số dư', value: `**${fmt(u.balance)}**`, inline: true }
+    );
+  return reply(m, { embeds: [embed] });
+});
+
+lenh.set('sell', (m, args) => {
+  const u = getUser(m.author.id);
+  const t = layTrader();
+  const coin = u.coin || 0;
+  const r = parseSL(args[0], coin);
+  if (r.error) return loi(m, r.error);
+  if (r.sl > coin) return loi(m, `Bạn chỉ có **${coin}** coin.`);
+  const thu = giaBan(t.price, r.sl);
+  const giaVon = coin ? Math.round(((u.coinCost || 0) / coin) * r.sl) : 0;
+  u.balance += thu;
+  u.coin = coin - r.sl;
+  u.coinCost = u.coin ? Math.max(0, (u.coinCost || 0) - giaVon) : 0;
+  save();
+  const lai = thu - giaVon;
+  const embed = khung(m.author, lai >= 0 ? MAU.thang : MAU.thua, '🔴 BÁN COIN')
+    .addFields(
+      { name: 'Số lượng', value: `**${r.sl}** coin`, inline: true },
+      { name: 'Giá', value: fmt(t.price), inline: true },
+      { name: 'Nhận về (đã trừ phí)', value: `**+${fmt(thu)}**`, inline: true },
+      { name: lai >= 0 ? '📗 Lãi' : '📕 Lỗ', value: `${lai >= 0 ? '+' : '-'}${fmt(Math.abs(lai))}`, inline: true },
+      { name: '🪙 Còn giữ', value: `${u.coin} coin`, inline: true },
+      { name: '💰 Số dư', value: `**${fmt(u.balance)}**`, inline: true }
+    );
+  return reply(m, { embeds: [embed] });
+});
+
+
 // ===================== KHỞI ĐỘNG BOT =====================
 // Chạy 1 lần khi bot online (nghe cả 'clientReady' và 'ready' để tương thích mọi bản discord.js 14)
 let daKhoiDong = false;
@@ -1672,7 +2420,7 @@ async function khiOnline() {
   try {
     // Đăng ký slash command (có thể mất vài phút để hiện lần đầu)
     await client.application.commands.set([
-      { name: 'game2d', description: 'Mở game trồng cây 2D multiplayer (khung chơi chỉ mình bạn nhìn thấy)' },
+      { name: 'game2d', description: 'Chọn game: trồng cây multiplayer hoặc rắn ăn táo (chỉ mình bạn nhìn thấy)' },
     ]);
   } catch (e) {
     console.error('Không đăng ký được slash command (hãy mời lại bot với scope applications.commands):', e);
@@ -1683,8 +2431,12 @@ client.once('ready', khiOnline);
 
 client.on('interactionCreate', async (i) => {
   try {
-    if (i.isChatInputCommand() && i.commandName === 'game2d') return await khoiDongGame(i);
-    if (i.isButton() && i.customId.startsWith('g2:')) return await xuLyNutGame(i);
+    if (i.isChatInputCommand() && i.commandName === 'game2d') return await hienMenuLenh(i);
+    if (i.isButton()) {
+      if (i.customId.startsWith('g2:')) return await xuLyNutGame(i);
+      if (i.customId.startsWith('sn:')) return await xuLyNutSnake(i);
+      if (i.customId.startsWith('gm:')) return await xuLyMenu(i);
+    }
   } catch (e) {
     console.error('Lỗi interaction:', e);
   }
