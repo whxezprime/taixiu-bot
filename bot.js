@@ -2432,7 +2432,7 @@ try { Voice = require('@discordjs/voice'); } catch { console.warn('Chưa cài @d
 const { spawn } = require('child_process');
 const { PassThrough } = require('stream');
 
-const YTDLP = process.env.YTDLP_PATH || 'yt-dlp';
+let YTDLP = process.env.YTDLP_PATH || 'yt-dlp'; // có thể đổi thành bản tự tải về trong thư mục bin/
 const SPOTIFY_ID = process.env.SPOTIFY_CLIENT_ID;
 const SPOTIFY_SECRET = process.env.SPOTIFY_CLIENT_SECRET;
 const NHAC_ROI_SAU = 5 * 60 * 1000;  // hàng chờ hết và không ai nghe thì tự thoát sau 5 phút
@@ -2461,7 +2461,7 @@ const loiRieng = (i, t) => i.reply({ content: `❌ ${t}`, flags: MessageFlags.Ep
 const suaLoi = (i, t) => i.editReply({ content: `❌ ${t}`, embeds: [], components: [] }).catch(() => {});
 
 // ---------- Chạy yt-dlp ----------
-function chayYtdlp(args, timeout = 60000) {
+function chayYtdlpTho(args, timeout = 60000) {
   return new Promise((resolve, reject) => {
     const p = spawn(YTDLP, args, { stdio: ['ignore', 'pipe', 'pipe'] });
     let out = '', err = '';
@@ -2475,6 +2475,10 @@ function chayYtdlp(args, timeout = 60000) {
       else reject(new Error(cat(err.trim().split('\n').pop() || `yt-dlp lỗi (${c})`, 200)));
     });
   });
+}
+async function chayYtdlp(args, timeout) {
+  await sanSangYtdlp();
+  return chayYtdlpTho(args, timeout);
 }
 const nguonTuUrl = (url) => (/soundcloud\.com/i.test(url) ? 'soundcloud' : /tiktok\.com/i.test(url) ? 'tiktok' : 'khac');
 function entryToTrack(e, src) {
@@ -2509,6 +2513,40 @@ function chayYtdlpHoacLenh(bin, arg) {
     p.on('error', reject);
     p.on('close', (c) => (c === 0 ? resolve() : reject(new Error('lỗi ' + c))));
   });
+}
+
+// ---------- Tự cài yt-dlp nếu máy chủ chưa có (host dạng container không dùng được apt/pkg) ----------
+async function taiFile(url, dich) {
+  const r = await fetch(url, { redirect: 'follow' });
+  if (!r.ok) throw new Error(`Tải thất bại (${r.status})`);
+  const tam = dich + '.tmp';
+  fs.writeFileSync(tam, Buffer.from(await r.arrayBuffer()));
+  fs.renameSync(tam, dich);
+  fs.chmodSync(dich, 0o755);
+}
+async function caiYtdlp() {
+  if (process.env.YTDLP_PATH) return; // đã tự chỉ định đường dẫn
+  try { await chayYtdlpHoacLenh(YTDLP, '--version'); return; } catch { /* chưa có trong PATH */ }
+  const dir = path.join(__dirname, 'bin');
+  fs.mkdirSync(dir, { recursive: true });
+  const local = path.join(dir, 'yt-dlp');
+  YTDLP = local;
+  try { await chayYtdlpHoacLenh(local, '--version'); return; } catch { /* chưa tải */ }
+  const base = 'https://github.com/yt-dlp/yt-dlp/releases/latest/download/';
+  const musl = fs.existsSync('/etc/alpine-release');
+  const ten = (musl ? 'yt-dlp_musllinux' : 'yt-dlp_linux') + (process.arch === 'arm64' ? '_aarch64' : '');
+  console.log(`⬇️ Đang tải yt-dlp (${ten})...`);
+  await taiFile(base + ten, local);
+  try { await chayYtdlpHoacLenh(local, '--version'); console.log('✅ Đã cài yt-dlp'); return; }
+  catch { console.warn('Bản standalone không chạy được, thử bản python (cần python3)...'); }
+  await taiFile(base + 'yt-dlp', local);
+  await chayYtdlpHoacLenh(local, '--version');
+  console.log('✅ Đã cài yt-dlp (bản python)');
+}
+let ytdlpSan = null;
+function sanSangYtdlp() {
+  if (!ytdlpSan) ytdlpSan = caiYtdlp().catch((e) => { console.error('⚠️ Không chuẩn bị được yt-dlp:', e.message); });
+  return ytdlpSan;
 }
 
 // ---------- TikTok dự phòng (khi yt-dlp lỗi) ----------
@@ -2624,6 +2662,7 @@ function moYtdlp(input) {
 }
 async function taoNguon(t) {
   const { createAudioResource, StreamType } = Voice;
+  await sanSangYtdlp();
   if (t.direct) return { resource: createAudioResource(t.direct, { inlineVolume: true }), proc: null };
   const ds = t.query ? [`scsearch1:${t.query}`, `ytsearch1:${t.query}`] : [t.url];
   let loiCuoi = new Error('Không lấy được âm thanh');
@@ -2868,10 +2907,10 @@ async function khiOnline() {
   if (daKhoiDong) return;
   daKhoiDong = true;
   console.log(`Bot đã online: ${client.user.tag}`);
-  for (const [ten, bin, arg] of [['yt-dlp', YTDLP, '--version'], ['ffmpeg', process.env.FFMPEG_PATH || 'ffmpeg', '-version']]) {
-    try { await chayYtdlpHoacLenh(bin, arg); }
-    catch { console.warn(`⚠️ Chưa tìm thấy ${ten} trên máy chạy bot, lệnh nhạc sẽ không phát được. Xem hướng dẫn cài đặt.`); }
-  }
+  sanSangYtdlp(); // tải yt-dlp nền nếu cần
+  let ff = 'ffmpeg';
+  try { ff = require('ffmpeg-static') || ff; } catch { /* dùng ffmpeg của hệ thống */ }
+  chayYtdlpHoacLenh(ff, '-version').catch(() => console.warn('⚠️ Chưa có ffmpeg: hãy chạy npm install (gói ffmpeg-static) hoặc cài ffmpeg trên máy chủ.'));
   try {
     // Đăng ký slash command (có thể mất vài phút để hiện lần đầu)
     await client.application.commands.set(LENH_SLASH);
