@@ -2502,10 +2502,19 @@ async function timKiemSC(q, n) {
   return (j.entries || []).map((e) => entryToTrack(e, 'soundcloud')).filter(Boolean);
 }
 
+// Kiểm tra nhanh một chương trình ngoài có chạy được không
+function chayYtdlpHoacLenh(bin, arg) {
+  return new Promise((resolve, reject) => {
+    const p = spawn(bin, [arg], { stdio: 'ignore' });
+    p.on('error', reject);
+    p.on('close', (c) => (c === 0 ? resolve() : reject(new Error('lỗi ' + c))));
+  });
+}
+
 // ---------- TikTok dự phòng (khi yt-dlp lỗi) ----------
 async function tiktokDuPhong(url) {
   const r = await fetch('https://www.tikwm.com/api/?url=' + encodeURIComponent(url));
-  const j = await r.json();
+  const j = await r.json().catch(() => null);
   if (!j || j.code !== 0 || !j.data) throw new Error('Không đọc được link TikTok');
   const d = j.data;
   let direct = d.music || d.play;
@@ -2591,7 +2600,8 @@ async function giaiDauVao(input) {
       if (ds.length) return ds;
       throw new Error('Link này không có bài hát nào');
     } catch (e) {
-      if (/tiktok\.com/i.test(input)) return tiktokDuPhong(input);
+      // thiếu yt-dlp thì báo luôn, không thử dự phòng
+      if (/tiktok\.com/i.test(input) && !/chưa cài yt-dlp/i.test(e.message)) return tiktokDuPhong(input);
       throw e;
     }
   }
@@ -2858,6 +2868,10 @@ async function khiOnline() {
   if (daKhoiDong) return;
   daKhoiDong = true;
   console.log(`Bot đã online: ${client.user.tag}`);
+  for (const [ten, bin, arg] of [['yt-dlp', YTDLP, '--version'], ['ffmpeg', process.env.FFMPEG_PATH || 'ffmpeg', '-version']]) {
+    try { await chayYtdlpHoacLenh(bin, arg); }
+    catch { console.warn(`⚠️ Chưa tìm thấy ${ten} trên máy chạy bot, lệnh nhạc sẽ không phát được. Xem hướng dẫn cài đặt.`); }
+  }
   try {
     // Đăng ký slash command (có thể mất vài phút để hiện lần đầu)
     await client.application.commands.set(LENH_SLASH);
