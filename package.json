@@ -1,16 +1,22 @@
 {
   "name": "bot-taixiu-discord",
   "version": "1.0.0",
-  "description": "Bot Discord: tài xỉu, bài 3 cây, bầu cua",
+  "description": "Bot Discord: tài xỉu, bài 3 cây, bầu cua, game 2D, trader, nghe nhạc",
   "main": "bot.js",
   "scripts": {
     "start": "node bot.js"
   },
   "engines": {
-    "node": ">=18"
+    "node": ">=22.12.0"
   },
   "dependencies": {
     "discord.js": "^14.16.3",
-    "dotenv": "^16.4.5"
+    "dotenv": "^16.4.5",
+    "@discordjs/voice": "^0.19.0",
+    "libsodium-wrappers": "^0.7.15",
+    "opusscript": "^0.1.1"
+  },
+  "optionalDependencies": {
+    "ffmpeg-static": "^5.2.0"
   }
 }
