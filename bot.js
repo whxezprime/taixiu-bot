@@ -2550,15 +2550,47 @@ function sanSangYtdlp() {
   return ytdlpSan;
 }
 
-// ---------- TikTok dự phòng (khi yt-dlp lỗi) ----------
+// ---------- TikTok: mở link rút gọn + dự phòng (khi yt-dlp lỗi) ----------
+const UA_WEB = 'Mozilla/5.0 (Linux; Android 13; Pixel 7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Mobile Safari/537.36';
+// vt.tiktok.com/xxx hoặc vm.tiktok.com/xxx -> https://www.tiktok.com/@user/video/ID
+async function moRongLinkNgan(url) {
+  if (!/(?:^|\/\/)(?:vt|vm)\.tiktok\.com\/|tiktok\.com\/t\//i.test(url)) return url;
+  let cur = url;
+  for (let k = 0; k < 4; k++) {
+    try {
+      const r = await fetch(cur, { redirect: 'manual', headers: { 'user-agent': UA_WEB }, signal: AbortSignal.timeout(8000) });
+      const loc = r.headers.get('location');
+      if (!loc) break;
+      cur = new URL(loc, cur).href;
+      if (RE_TT_DON.test(cur)) return cur.split('?')[0];
+    } catch { break; }
+  }
+  return RE_TT_DON.test(cur) ? cur.split('?')[0] : url;
+}
+// Lấy thông tin + link âm thanh trực tiếp qua tikwm (thử lại 1 lần nếu bị giới hạn 1 request/giây)
+async function tikwmLay(url) {
+  let loi = 'API không phản hồi';
+  for (let k = 0; k < 2; k++) {
+    try {
+      const r = await fetch('https://www.tikwm.com/api/?url=' + encodeURIComponent(url), { headers: { 'user-agent': UA_WEB }, signal: AbortSignal.timeout(12000) });
+      const j = await r.json().catch(() => null);
+      if (j && j.code === 0 && j.data) return j.data;
+      loi = (j && j.msg) || `HTTP ${r.status}`;
+      if (!/limit/i.test(loi)) break;
+    } catch (e) { loi = e.message; }
+    await new Promise((res) => setTimeout(res, 1300));
+  }
+  throw new Error(`tikwm: ${cat(String(loi), 80)}`);
+}
+const duongDanTikwm = (d) => {
+  const u = d.music || d.play;
+  if (!u) return null;
+  return u.startsWith('/') ? 'https://www.tikwm.com' + u : u;
+};
 async function tiktokDuPhong(url) {
-  const r = await fetch('https://www.tikwm.com/api/?url=' + encodeURIComponent(url));
-  const j = await r.json().catch(() => null);
-  if (!j || j.code !== 0 || !j.data) throw new Error('Không đọc được link TikTok');
-  const d = j.data;
-  let direct = d.music || d.play;
+  const d = await tikwmLay(url);
+  const direct = duongDanTikwm(d);
   if (!direct) throw new Error('Link TikTok này không có âm thanh');
-  if (direct.startsWith('/')) direct = 'https://www.tikwm.com' + direct;
   return [{
     title: cat(String(d.title || 'TikTok'), 100), artist: (d.author && d.author.nickname) || 'TikTok',
     dur: d.duration || null, direct, url, src: 'tiktok', thumb: d.cover || null,
@@ -2652,15 +2684,20 @@ async function giaiDauVao(input) {
   input = input.trim();
   if (RE_SP.test(input)) return giaiSpotify(input);
   if (/^https?:\/\//i.test(input)) {
+    if (/tiktok\.com/i.test(input)) input = await moRongLinkNgan(input);
     const nhanh = await layOEmbed(input);
-    if (nhanh) return [nhanh];
+    if (nhanh) return [nhanh]; // phát bằng yt-dlp, lỗi thì tự thử tikwm lúc phát
     try {
       const ds = await layThongTin(input);
       if (ds.length) return ds;
       throw new Error('Link này không có bài hát nào');
     } catch (e) {
       // thiếu yt-dlp thì báo luôn, không thử dự phòng
-      if (/tiktok\.com/i.test(input) && !/chưa cài yt-dlp/i.test(e.message)) return tiktokDuPhong(input);
+      if (/tiktok\.com/i.test(input) && !/chưa cài yt-dlp/i.test(e.message)) {
+        console.error('[nhạc] yt-dlp lỗi với TikTok:', e.message);
+        try { return await tiktokDuPhong(input); }
+        catch (e2) { throw new Error(`Không đọc được link TikTok (${cat(e.message, 90)} | ${e2.message})`); }
+      }
       throw e;
     }
   }
@@ -2693,6 +2730,11 @@ async function taoNguon(t) {
       const { stream, proc } = await moYtdlp(inp);
       return { resource: createAudioResource(stream, { inputType: StreamType.Arbitrary, inlineVolume: true }), proc };
     } catch (e) { loiCuoi = e; }
+  }
+  if (t.src === 'tiktok' && t.url) { // yt-dlp bị TikTok chặn -> lấy âm thanh qua tikwm
+    console.error('[nhạc] yt-dlp lỗi với TikTok, thử tikwm:', loiCuoi.message);
+    const direct = duongDanTikwm(await tikwmLay(t.url));
+    if (direct) return { resource: createAudioResource(direct, { inlineVolume: true }), proc: null };
   }
   throw loiCuoi;
 }
