@@ -2507,11 +2507,12 @@ async function timKiemSC(q, n) {
 }
 
 // Kiểm tra nhanh một chương trình ngoài có chạy được không
-function chayYtdlpHoacLenh(bin, arg) {
+function chayYtdlpHoacLenh(bin, arg, timeout = 90000) {
   return new Promise((resolve, reject) => {
     const p = spawn(bin, [arg], { stdio: 'ignore' });
-    p.on('error', reject);
-    p.on('close', (c) => (c === 0 ? resolve() : reject(new Error('lỗi ' + c))));
+    const t = setTimeout(() => { try { p.kill('SIGKILL'); } catch {} reject(new Error('quá thời gian')); }, timeout);
+    p.on('error', (e) => { clearTimeout(t); reject(e); });
+    p.on('close', (c) => { clearTimeout(t); c === 0 ? resolve() : reject(new Error('lỗi ' + c)); });
   });
 }
 
@@ -2629,10 +2630,30 @@ async function spTimKiem(q, n) {
 }
 
 // Đổi link/từ khóa người dùng nhập thành danh sách bài
+// oEmbed: lấy tên bài/nghệ sĩ/ảnh bằng 1 request HTTP nhẹ (chỉ cho link bài đơn lẻ), nhanh hơn nhiều so với chạy yt-dlp
+const RE_SC_DON = /^https?:\/\/(?:www\.|m\.)?soundcloud\.com\/[^/?#]+\/(?!(?:sets|likes|tracks|albums|reposts|popular-tracks|following|followers)(?:[/?#]|$))[^/?#]+\/?(?:[?#].*)?$/i;
+const RE_TT_DON = /^https?:\/\/(?:www\.)?tiktok\.com\/@[^/?#]+\/video\/\d+/i;
+async function layOEmbed(url) {
+  const ep = RE_SC_DON.test(url) ? 'https://soundcloud.com/oembed?format=json&url='
+    : RE_TT_DON.test(url) ? 'https://www.tiktok.com/oembed?url=' : null;
+  if (!ep) return null;
+  const ctl = new AbortController();
+  const tm = setTimeout(() => ctl.abort(), 8000);
+  try {
+    const r = await fetch(ep + encodeURIComponent(url), { signal: ctl.signal });
+    if (!r.ok) return null;
+    const j = await r.json();
+    if (!j || !j.title) return null;
+    return { title: cat(String(j.title), 100), artist: j.author_name || '', dur: 0, url, src: nguonTuUrl(url), thumb: j.thumbnail_url || null };
+  } catch { return null; } finally { clearTimeout(tm); }
+}
+
 async function giaiDauVao(input) {
   input = input.trim();
   if (RE_SP.test(input)) return giaiSpotify(input);
   if (/^https?:\/\//i.test(input)) {
+    const nhanh = await layOEmbed(input);
+    if (nhanh) return [nhanh];
     try {
       const ds = await layThongTin(input);
       if (ds.length) return ds;
@@ -2654,10 +2675,11 @@ function moYtdlp(input) {
     const p = spawn(YTDLP, ['-f', 'bestaudio/best', '--no-playlist', '-q', '--no-warnings', '--no-part', '-o', '-', input], { stdio: ['ignore', 'pipe', 'pipe'] });
     const pass = new PassThrough();
     let co = false, err = '';
+    const hetGio = setTimeout(() => { if (!co) { try { p.kill('SIGKILL'); } catch {} reject(new Error('Mở luồng nhạc quá lâu (host chậm hoặc nguồn chặn)')); } }, 90000);
     p.stderr.on('data', (d) => { err += d; });
-    p.on('error', (e) => reject(new Error(e.code === 'ENOENT' ? 'Máy chủ chưa cài yt-dlp' : e.message)));
-    p.stdout.once('data', (chunk) => { co = true; pass.write(chunk); p.stdout.pipe(pass); resolve({ stream: pass, proc: p }); });
-    p.on('close', () => { if (!co) reject(new Error(cat(err.trim().split('\n').pop() || 'Không lấy được âm thanh', 200))); });
+    p.on('error', (e) => { clearTimeout(hetGio); reject(new Error(e.code === 'ENOENT' ? 'Máy chủ chưa cài yt-dlp' : e.message)); });
+    p.stdout.once('data', (chunk) => { clearTimeout(hetGio); co = true; pass.write(chunk); p.stdout.pipe(pass); resolve({ stream: pass, proc: p }); });
+    p.on('close', () => { clearTimeout(hetGio); if (!co) reject(new Error(cat(err.trim().split('\n').pop() || 'Không lấy được âm thanh', 200))); });
   });
 }
 async function taoNguon(t) {
@@ -2756,7 +2778,9 @@ async function phatBai(g) {
   if (!t) { g.cur = null; g.resource = null; datRoi(g); return; }
   g.dangMo = true; g.cur = t;
   try {
+    const tBat = Date.now();
     const { resource, proc } = await taoNguon(t);
+    console.log(`[nhạc] mở luồng âm thanh sau ${((Date.now() - tBat) / 1000).toFixed(1)}s`);
     g.proc = proc;
     resource.volume.setVolume(g.vol / 100);
     g.resource = resource;
@@ -2801,8 +2825,11 @@ async function xuLyNhac(i) {
       if (!vc) return;
       await i.deferReply();
       try {
+        const tBatDau = Date.now();
         const tracks = await giaiDauVao(i.options.getString('link', true));
+        console.log(`[nhạc] giải link xong sau ${((Date.now() - tBatDau) / 1000).toFixed(1)}s (${tracks.length} bài)`);
         const { g: gg, phatNgay } = await themVaPhat(i.guild, vc, i.channel, tracks, i.user);
+        console.log(`[nhạc] vào kênh/xếp hàng xong sau ${((Date.now() - tBatDau) / 1000).toFixed(1)}s`);
         const t0 = tracks[0];
         const mo = tracks.length > 1
           ? `✅ Đã thêm **${tracks.length}** bài vào hàng chờ.`
