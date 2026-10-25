@@ -2502,6 +2502,10 @@ async function layThongTin(url) {
   return t ? [t] : [];
 }
 async function timKiemSC(q, n) {
+  try {
+    const ds = (await scTimKiemObj(q, n)).map(scToTrack);
+    if (ds.length) return ds;
+  } catch (e) { console.error('[nhạc] SoundCloud API (tìm kiếm):', e.message); }
   const j = JSON.parse(await chayYtdlp(['--flat-playlist', '-J', '--no-warnings', `scsearch${n}:${q}`]));
   return (j.entries || []).map((e) => entryToTrack(e, 'soundcloud')).filter(Boolean);
 }
@@ -2568,11 +2572,42 @@ async function moRongLinkNgan(url) {
   return RE_TT_DON.test(cur) ? cur.split('?')[0] : url;
 }
 // Lấy thông tin + link âm thanh trực tiếp qua tikwm (thử lại 1 lần nếu bị giới hạn 1 request/giây)
+const UA_PC = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36';
+// TikTok có 2 dạng link: .../video/ID và .../photo/ID (bài ảnh). Đưa về dạng /video/ID và bỏ phần theo dõi (?_r=...)
+const chuanTikTok = (url) => url.split(/[?#]/)[0].replace(/\/photo\/(\d+)/i, '/video/$1');
+// Đọc thẳng trang TikTok: lấy tên bài, nghệ sĩ, ảnh và link nhạc nền (dùng được cho cả video lẫn bài ảnh)
+async function tiktokTrang(url) {
+  const r = await fetch(url, {
+    redirect: 'follow', headers: { 'user-agent': UA_PC, 'accept-language': 'en-US,en;q=0.9', accept: 'text/html,application/xhtml+xml' },
+    signal: AbortSignal.timeout(12000),
+  });
+  const html = await r.text();
+  const m = html.match(/<script id="__UNIVERSAL_DATA_FOR_REHYDRATION__" type="application\/json">([\s\S]*?)<\/script>/);
+  if (!m) throw new Error(`trang TikTok không có dữ liệu (HTTP ${r.status})`);
+  const scope = JSON.parse(m[1]).__DEFAULT_SCOPE__ || {};
+  const it = scope['webapp.video-detail'] && scope['webapp.video-detail'].itemInfo && scope['webapp.video-detail'].itemInfo.itemStruct;
+  const mu = it && it.music;
+  if (!it || !mu || !mu.playUrl) throw new Error('trang TikTok không có link nhạc');
+  const anh = (it.imagePost && it.imagePost.cover && it.imagePost.cover.imageURL && it.imagePost.cover.imageURL.urlList || [])[0];
+  return [{
+    title: cat(String(mu.title || it.desc || 'TikTok'), 100), artist: mu.authorName || (it.author && it.author.nickname) || 'TikTok',
+    dur: mu.duration || null, direct: mu.playUrl, directAt: Date.now(),
+    directHeaders: { Referer: 'https://www.tiktok.com/', 'User-Agent': UA_PC },
+    url, src: 'tiktok', thumb: (it.video && it.video.cover) || anh || null,
+  }];
+}
 async function tikwmLay(url) {
   let loi = 'API không phản hồi';
   for (let k = 0; k < 2; k++) {
     try {
-      const r = await fetch('https://www.tikwm.com/api/?url=' + encodeURIComponent(url), { headers: { 'user-agent': UA_WEB }, signal: AbortSignal.timeout(12000) });
+      let r = await fetch('https://www.tikwm.com/api/?url=' + encodeURIComponent(url), { headers: { 'user-agent': UA_WEB }, signal: AbortSignal.timeout(12000) });
+      if (r.status === 403 || r.status === 429) { // bị chặn bằng GET -> thử POST giống trình duyệt
+        r = await fetch('https://www.tikwm.com/api/', {
+          method: 'POST',
+          headers: { 'user-agent': UA_PC, 'content-type': 'application/x-www-form-urlencoded; charset=UTF-8', origin: 'https://www.tikwm.com', referer: 'https://www.tikwm.com/' },
+          body: 'url=' + encodeURIComponent(url) + '&count=12&cursor=0&web=1&hd=0', signal: AbortSignal.timeout(12000),
+        });
+      }
       const j = await r.json().catch(() => null);
       if (j && j.code === 0 && j.data) return j.data;
       loi = (j && j.msg) || `HTTP ${r.status}`;
@@ -2593,7 +2628,7 @@ async function tiktokDuPhong(url) {
   if (!direct) throw new Error('Link TikTok này không có âm thanh');
   return [{
     title: cat(String(d.title || 'TikTok'), 100), artist: (d.author && d.author.nickname) || 'TikTok',
-    dur: d.duration || null, direct, url, src: 'tiktok', thumb: d.cover || null,
+    dur: d.duration || null, direct, directAt: Date.now(), url, src: 'tiktok', thumb: d.cover || null,
   }];
 }
 
@@ -2664,7 +2699,7 @@ async function spTimKiem(q, n) {
 // Đổi link/từ khóa người dùng nhập thành danh sách bài
 // oEmbed: lấy tên bài/nghệ sĩ/ảnh bằng 1 request HTTP nhẹ (chỉ cho link bài đơn lẻ), nhanh hơn nhiều so với chạy yt-dlp
 const RE_SC_DON = /^https?:\/\/(?:www\.|m\.)?soundcloud\.com\/[^/?#]+\/(?!(?:sets|likes|tracks|albums|reposts|popular-tracks|following|followers)(?:[/?#]|$))[^/?#]+\/?(?:[?#].*)?$/i;
-const RE_TT_DON = /^https?:\/\/(?:www\.)?tiktok\.com\/@[^/?#]+\/video\/\d+/i;
+const RE_TT_DON = /^https?:\/\/(?:www\.)?tiktok\.com\/@[^/?#]+\/(?:video|photo)\/\d+/i;
 async function layOEmbed(url) {
   const ep = RE_SC_DON.test(url) ? 'https://soundcloud.com/oembed?format=json&url='
     : RE_TT_DON.test(url) ? 'https://www.tiktok.com/oembed?url=' : null;
@@ -2684,22 +2719,35 @@ async function giaiDauVao(input) {
   input = input.trim();
   if (RE_SP.test(input)) return giaiSpotify(input);
   if (/^https?:\/\//i.test(input)) {
-    if (/tiktok\.com/i.test(input)) input = await moRongLinkNgan(input);
+    if (/soundcloud\.com|snd\.sc/i.test(input)) { // đường nhanh: API SoundCloud (tên bài + link phát cùng lúc)
+      try {
+        const o = await scResolve(input);
+        const tr = scToTrack(o);
+        tr.luongP = scStream(o).then((u) => ({ url: u })).catch(() => null);
+        return [tr];
+      } catch (e) { console.error('[nhạc] SoundCloud API (đọc link):', e.message); }
+    }
+    if (/tiktok\.com/i.test(input)) {
+      input = chuanTikTok(await moRongLinkNgan(input)); // link rút gọn / link ảnh (photo) -> link video chuẩn
+      const loi = [];
+      for (const [ten, f] of [['trang TikTok', tiktokTrang], ['tikwm', tiktokDuPhong]]) { // 1 request lấy luôn tên bài + link nhạc
+        try { return await f(input); } catch (e) { console.error(`[nhạc] ${ten}:`, e.message); loi.push(`${ten}: ${cat(e.message, 70)}`); }
+      }
+      const nhanh = await layOEmbed(input); // chỉ có tên bài, link nhạc lấy lúc phát
+      if (nhanh) return [nhanh];
+      try {
+        const ds = await layThongTin(input);
+        if (ds.length) return ds;
+      } catch (e) { loi.push(`yt-dlp: ${cat(e.message, 70)}`); }
+      throw new Error(`Không đọc được link TikTok (${loi.join(' | ')})`);
+    }
     const nhanh = await layOEmbed(input);
-    if (nhanh) return [nhanh]; // phát bằng yt-dlp, lỗi thì tự thử tikwm lúc phát
+    if (nhanh) return [nhanh];
     try {
       const ds = await layThongTin(input);
       if (ds.length) return ds;
       throw new Error('Link này không có bài hát nào');
-    } catch (e) {
-      // thiếu yt-dlp thì báo luôn, không thử dự phòng
-      if (/tiktok\.com/i.test(input) && !/chưa cài yt-dlp/i.test(e.message)) {
-        console.error('[nhạc] yt-dlp lỗi với TikTok:', e.message);
-        try { return await tiktokDuPhong(input); }
-        catch (e2) { throw new Error(`Không đọc được link TikTok (${cat(e.message, 90)} | ${e2.message})`); }
-      }
-      throw e;
-    }
+    } catch (e) { throw e; }
   }
   const r = await timKiemSC(input, 1);
   if (!r.length) throw new Error('Không tìm thấy bài nào với từ khóa này.');
@@ -2719,24 +2767,161 @@ function moYtdlp(input) {
     p.on('close', () => { clearTimeout(hetGio); if (!co) reject(new Error(cat(err.trim().split('\n').pop() || 'Không lấy được âm thanh', 200))); });
   });
 }
-async function taoNguon(t) {
-  const { createAudioResource, StreamType } = Voice;
-  await sanSangYtdlp();
-  if (t.direct) return { resource: createAudioResource(t.direct, { inlineVolume: true }), proc: null };
-  const ds = t.query ? [`scsearch1:${t.query}`, `ytsearch1:${t.query}`] : [t.url];
-  let loiCuoi = new Error('Không lấy được âm thanh');
-  for (const inp of ds) {
+// ---------- Âm thanh chất lượng cao: ffmpeg -> Opus (không mã hóa Opus bằng JS nên nhẹ CPU, đỡ rè/giật) ----------
+const NHAC_KBPS = Math.min(256, Math.max(64, parseInt(process.env.NHAC_KBPS, 10) || 128)); // bitrate Opus gửi lên Discord (đặt NHAC_KBPS để đổi)
+let _ffBin = null;
+function ffmpegBin() {
+  if (_ffBin) return _ffBin;
+  if (process.env.FFMPEG_PATH) return (_ffBin = process.env.FFMPEG_PATH);
+  try { const p = require('ffmpeg-static'); if (p && fs.existsSync(p)) return (_ffBin = p); } catch { /* dùng ffmpeg của hệ thống */ }
+  return (_ffBin = 'ffmpeg');
+}
+
+// ---------- SoundCloud API: lấy tên bài + link phát trực tiếp chỉ trong ~1-2 giây (nhanh hơn yt-dlp nhiều) ----------
+let scClient = { id: process.env.SOUNDCLOUD_CLIENT_ID || null, exp: process.env.SOUNDCLOUD_CLIENT_ID ? Infinity : 0 };
+const SC_CACHE = path.join(__dirname, 'bin', 'sc_client_id.json');
+async function scClientId() {
+  if (scClient.id && Date.now() < scClient.exp) return scClient.id;
+  try { // đọc từ file lưu sẵn nếu còn hạn
+    const c = JSON.parse(fs.readFileSync(SC_CACHE, 'utf8'));
+    if (c.id && c.exp > Date.now()) { scClient = c; return c.id; }
+  } catch { /* chưa có file */ }
+  const html = await (await fetch('https://soundcloud.com/', { headers: { 'user-agent': UA_WEB }, signal: AbortSignal.timeout(10000) })).text();
+  const urls = [...html.matchAll(/<script[^>]+src="(https:\/\/a-v2\.sndcdn\.com\/assets\/[^"]+\.js)"/g)].map((m) => m[1]).reverse();
+  for (const u of urls.slice(0, 6)) {
     try {
-      const { stream, proc } = await moYtdlp(inp);
-      return { resource: createAudioResource(stream, { inputType: StreamType.Arbitrary, inlineVolume: true }), proc };
-    } catch (e) { loiCuoi = e; }
+      const js = await (await fetch(u, { signal: AbortSignal.timeout(10000) })).text();
+      const m = js.match(/client_id\s*[:=]\s*"([a-zA-Z0-9]{32})"/);
+      if (m) {
+        scClient = { id: m[1], exp: Date.now() + 6 * 3600 * 1000 };
+        try { fs.mkdirSync(path.dirname(SC_CACHE), { recursive: true }); fs.writeFileSync(SC_CACHE, JSON.stringify(scClient)); } catch { /* không ghi được cũng không sao */ }
+        return m[1];
+      }
+    } catch { /* thử file kế tiếp */ }
   }
-  if (t.src === 'tiktok' && t.url) { // yt-dlp bị TikTok chặn -> lấy âm thanh qua tikwm
-    console.error('[nhạc] yt-dlp lỗi với TikTok, thử tikwm:', loiCuoi.message);
-    const direct = duongDanTikwm(await tikwmLay(t.url));
-    if (direct) return { resource: createAudioResource(direct, { inlineVolume: true }), proc: null };
+  throw new Error('Không lấy được client_id SoundCloud');
+}
+async function scGet(url) {
+  for (let k = 0; k < 2; k++) {
+    const id = await scClientId();
+    const r = await fetch(url + (url.includes('?') ? '&' : '?') + 'client_id=' + id, { headers: { 'user-agent': UA_WEB }, signal: AbortSignal.timeout(10000) });
+    if (r.status === 401 || r.status === 403) { scClient = { id: null, exp: 0 }; try { fs.unlinkSync(SC_CACHE); } catch { /* */ } continue; } // client_id hết hạn -> lấy lại
+    if (!r.ok) throw new Error('SoundCloud HTTP ' + r.status);
+    return r.json();
   }
-  throw loiCuoi;
+  throw new Error('SoundCloud từ chối client_id');
+}
+async function scResolve(url) {
+  const t = await scGet('https://api-v2.soundcloud.com/resolve?url=' + encodeURIComponent(url));
+  if (!t || t.kind !== 'track') throw new Error('Không phải bài hát đơn lẻ');
+  return t;
+}
+async function scStream(t) {
+  const tc = (t.media && t.media.transcodings) || [];
+  const chon = tc.find((x) => x.format.protocol === 'progressive')
+    || tc.find((x) => x.format.protocol === 'hls' && /mpeg|mp3/i.test(x.format.mime_type))
+    || tc.find((x) => x.format.protocol === 'hls');
+  if (!chon) throw new Error('Bài này không có luồng phát');
+  const j = await scGet(chon.url + (chon.url.includes('?') ? '&' : '?') + 'track_authorization=' + encodeURIComponent(t.track_authorization || ''));
+  if (!j || !j.url) throw new Error('SoundCloud không trả link phát');
+  return j.url;
+}
+const scToTrack = (t) => ({
+  title: cat(String(t.title || 'Không rõ'), 100), artist: (t.user && t.user.username) || '',
+  dur: Math.round((t.duration || 0) / 1000), url: t.permalink_url, src: 'soundcloud',
+  thumb: t.artwork_url ? t.artwork_url.replace('-large', '-t300x300') : null, scObj: t,
+});
+async function scTimKiemObj(q, n) {
+  const j = await scGet(`https://api-v2.soundcloud.com/search/tracks?q=${encodeURIComponent(q)}&limit=${n}`);
+  return ((j && j.collection) || []).filter((x) => x && x.kind === 'track');
+}
+
+// ---------- Lấy link phát trực tiếp (ưu tiên cách nhanh, yt-dlp chỉ là phương án dự phòng) ----------
+async function ytDirect(input) {
+  const j = JSON.parse(await chayYtdlp(['-f', 'bestaudio/best', '--no-playlist', '-J', '--no-warnings', input], 90000));
+  const e = (j.entries && j.entries[0]) || j;
+  const f = (e.requested_formats && e.requested_formats[0]) || e;
+  if (!f.url) throw new Error('Không có link trực tiếp');
+  if (!/^(https?|m3u8|m3u8_native)$/.test(f.protocol || 'https')) throw new Error('Giao thức không hỗ trợ: ' + f.protocol);
+  return { url: f.url, headers: f.http_headers || e.http_headers || null };
+}
+async function layLuongUrl(t) {
+  if (t.direct && (!t.directAt || Date.now() - t.directAt < 10 * 60 * 1000)) return { url: t.direct, headers: t.directHeaders || null }; // link TikTok hết hạn sau ít phút
+  const log = (m, e) => console.error(`[nhạc] ${m}:`, e.message);
+  if (t.query) { // Spotify / từ khóa: tìm trên SoundCloud bằng API
+    try {
+      const ds = await scTimKiemObj(t.query, 5);
+      if (ds.length) {
+        let tot = ds[0];
+        if (t.dur) {
+          const gan = ds.filter((x) => x.duration).sort((a, b) => Math.abs(a.duration / 1000 - t.dur) - Math.abs(b.duration / 1000 - t.dur));
+          if (gan.length && Math.abs(gan[0].duration / 1000 - t.dur) <= 20) tot = gan[0];
+        }
+        return { url: await scStream(tot) };
+      }
+    } catch (e) { log('SoundCloud API (tìm bài)', e); }
+    let loi = new Error('Không tìm thấy nguồn phát');
+    for (const pre of ['scsearch1', 'ytsearch1']) {
+      try { return await ytDirect(`${pre}:${t.query}`); } catch (e) { loi = e; }
+    }
+    throw loi;
+  }
+  if (t.src === 'soundcloud' && t.url) {
+    try { return { url: await scStream(t.scObj || await scResolve(t.url)) }; } catch (e) { log('SoundCloud API', e); }
+  } else if (t.src === 'tiktok' && t.url) {
+    const u0 = chuanTikTok(t.url);
+    try { const tr = (await tiktokTrang(u0))[0]; return { url: tr.direct, headers: tr.directHeaders }; } catch (e) { log('trang TikTok', e); }
+    try { const u = duongDanTikwm(await tikwmLay(u0)); if (u) return { url: u }; } catch (e) { log('tikwm', e); }
+    return ytDirect(u0);
+  }
+  return ytDirect(t.url);
+}
+async function layLuongPipe(t) { // phương án cuối: yt-dlp tải rồi chuyển qua ffmpeg
+  const ds = t.query ? [`scsearch1:${t.query}`, `ytsearch1:${t.query}`] : [t.src === 'tiktok' && t.url ? chuanTikTok(t.url) : t.url];
+  let loi = new Error('Không lấy được âm thanh');
+  for (const inp of ds) {
+    try { const { stream, proc } = await moYtdlp(inp); return { pipe: { stream, proc } }; } catch (e) { loi = e; }
+  }
+  throw loi;
+}
+
+// Tạo luồng Opus từ link trực tiếp (hoặc từ yt-dlp qua pipe). vol: 0-200 (%), seek: giây bắt đầu.
+function taoOgg(luong, vol, seek, baoLoi) {
+  const args = ['-hide_banner', '-loglevel', 'error'];
+  if (luong.url) {
+    args.push('-reconnect', '1', '-reconnect_streamed', '1', '-reconnect_delay_max', '5', '-probesize', '262144', '-analyzeduration', '1000000');
+    const h = Object.entries(luong.headers || {}).filter(([k]) => !/^(range|accept-encoding|host)$/i.test(k)).map(([k, v]) => `${k}: ${v}\r\n`).join('');
+    if (h) args.push('-headers', h);
+    if (seek > 0) args.push('-ss', seek.toFixed(2));
+    args.push('-i', luong.url);
+  } else {
+    args.push('-i', 'pipe:0');
+  }
+  args.push('-vn');
+  // limiter nhẹ cho mọi bài: nguồn bị clip (TikTok/DJ remix...) khi mã hóa Opus rất dễ rè; level=0 để không tự nâng âm lượng
+  args.push('-af', `${vol !== 100 ? `volume=${vol / 100},` : ''}alimiter=limit=0.95:level=0`);
+  args.push('-c:a', 'libopus', '-b:a', `${NHAC_KBPS}k`, '-vbr', 'on', '-compression_level', '10', '-frame_duration', '20', '-application', 'audio', '-ar', '48000', '-ac', '2', '-f', 'ogg', 'pipe:1');
+  const ff = spawn(ffmpegBin(), args, { stdio: [luong.url ? 'ignore' : 'pipe', 'pipe', 'pipe'] });
+  let killed = false, loi = '';
+  const kill = () => {
+    killed = true;
+    try { ff.kill('SIGKILL'); } catch { /* */ }
+    if (luong.pipe) { try { luong.pipe.proc.kill('SIGKILL'); } catch { /* */ } }
+  };
+  ff.stderr.on('data', (d) => { loi = (loi + d).slice(-500); });
+  ff.stdout.on('error', () => {});
+  ff.on('error', (e) => { if (!killed) baoLoi(e.code === 'ENOENT' ? 'Máy chủ chưa có ffmpeg' : e.message); });
+  ff.on('close', (code) => {
+    if (!killed && code !== 0) baoLoi(loi.trim().split('\n').pop() || `ffmpeg lỗi (${code})`);
+    if (luong.pipe) { try { luong.pipe.proc.kill('SIGKILL'); } catch { /* */ } }
+  });
+  if (luong.pipe) {
+    ff.stdin.on('error', () => {});
+    luong.pipe.stream.on('error', () => {});
+    luong.pipe.stream.pipe(ff.stdin);
+  }
+  const resource = Voice.createAudioResource(ff.stdout, { inputType: Voice.StreamType.OggOpus });
+  return { resource, kill };
 }
 
 // ---------- Trạng thái phát nhạc của từng server ----------
@@ -2821,19 +3006,40 @@ async function phatBai(g) {
   g.dangMo = true; g.cur = t;
   try {
     const tBat = Date.now();
-    const { resource, proc } = await taoNguon(t);
-    console.log(`[nhạc] mở luồng âm thanh sau ${((Date.now() - tBat) / 1000).toFixed(1)}s`);
-    g.proc = proc;
-    resource.volume.setVolume(g.vol / 100);
-    g.resource = resource;
-    g.player.play(resource);
+    let luong = t.luongP ? await t.luongP : null; // link đã được tải trước (nếu có)
+    if (!luong) luong = await layLuongUrl(t).catch((e) => { console.error('[nhạc] không lấy được link trực tiếp:', e.message); return null; });
+    if (!luong) luong = await layLuongPipe(t);
+    const o = taoOgg(luong, g.vol, 0, (m) => g.textCh.send(`❌ Lỗi khi phát **${t.title}**: ${cat(m, 150)}`).catch(() => {}));
+    console.log(`[nhạc] sẵn sàng phát sau ${((Date.now() - tBat) / 1000).toFixed(1)}s (${luong.url ? 'link trực tiếp' : 'qua yt-dlp'})`);
+    g.proc = { kill: o.kill };
+    g.resource = o.resource; g.luong = luong.url ? luong : null; g.batDau = 0;
+    g.player.play(o.resource);
     g.textCh.send({ embeds: [embedDangPhat(t, g)] }).catch(() => {});
+    const ke = g.queue[0]; // tải trước link bài kế tiếp để chuyển bài không bị chờ
+    if (ke && !ke.luongP) ke.luongP = layLuongUrl(ke).catch(() => null);
   } catch (e) {
     g.textCh.send(`❌ Không phát được **${t.title}**: ${cat(e.message, 150)}`).catch(() => {});
     g.cur = null; g.dangMo = false;
     return phatBai(g);
   }
   g.dangMo = false;
+}
+
+// Đổi âm lượng khi đang phát: mở lại luồng ffmpeg tại đúng vị trí hiện tại (chỉ làm được với link trực tiếp)
+function khoiLaiAmLuong(g) {
+  if (!g.cur || !g.resource || !g.luong) return false;
+  try {
+    const pos = (g.batDau || 0) + g.resource.playbackDuration / 1000;
+    const trangThai = g.player.state.status;
+    const cu = g.proc;
+    const t = g.cur;
+    const o = taoOgg(g.luong, g.vol, pos, (m) => g.textCh.send(`❌ Lỗi khi phát **${t.title}**: ${cat(m, 150)}`).catch(() => {}));
+    g.proc = { kill: o.kill }; g.resource = o.resource; g.batDau = pos;
+    g.player.play(o.resource);
+    if (cu) { try { cu.kill(); } catch { /* */ } }
+    if (trangThai === Voice.AudioPlayerStatus.Paused || trangThai === Voice.AudioPlayerStatus.AutoPaused) g.player.pause();
+    return true;
+  } catch (e) { console.error('[nhạc] đổi âm lượng lỗi:', e.message); return false; }
 }
 
 async function themVaPhat(guild, vc, textCh, tracks, nguoi) {
@@ -2868,7 +3074,7 @@ async function xuLyNhac(i) {
       await i.deferReply();
       try {
         const tBatDau = Date.now();
-        const tracks = await giaiDauVao(i.options.getString('link', true));
+        const [tracks] = await Promise.all([giaiDauVao(i.options.getString('link', true)), vaoKenh(i.guild, vc, i.channel)]); // vào kênh voice song song để đỡ chờ
         console.log(`[nhạc] giải link xong sau ${((Date.now() - tBatDau) / 1000).toFixed(1)}s (${tracks.length} bài)`);
         const { g: gg, phatNgay } = await themVaPhat(i.guild, vc, i.channel, tracks, i.user);
         console.log(`[nhạc] vào kênh/xếp hàng xong sau ${((Date.now() - tBatDau) / 1000).toFixed(1)}s`);
@@ -2899,8 +3105,8 @@ async function xuLyNhac(i) {
       if (!g) return loiRieng(i, 'Bot đang không ở trong kênh voice nào. Dùng `/join` hoặc `/playmusic` trước.');
       const v = Math.max(0, Math.min(200, i.options.getInteger('volume', true)));
       g.vol = v;
-      if (g.resource && g.resource.volume) g.resource.volume.setVolume(v / 100);
-      return i.reply({ embeds: [new EmbedBuilder().setColor(MAU.vang).setDescription(`🔊 Âm lượng: **${v}%**${v > 100 ? ' (trên 100% có thể bị rè)' : ''}`)] });
+      const ngay = khoiLaiAmLuong(g);
+      return i.reply({ embeds: [new EmbedBuilder().setColor(MAU.vang).setDescription(`🔊 Âm lượng: **${v}%**${v > 100 ? ' (trên 100% có thể bị rè)' : ''}${g.cur && !ngay ? '\n*Âm lượng mới áp dụng từ bài kế tiếp.*' : ''}`)] });
     }
     case 'stop': {
       if (!g || !g.cur) return loiRieng(i, 'Không có bài nào đang phát.');
@@ -2977,9 +3183,14 @@ async function khiOnline() {
   daKhoiDong = true;
   console.log(`Bot đã online: ${client.user.tag}`);
   sanSangYtdlp(); // tải yt-dlp nền nếu cần
-  let ff = 'ffmpeg';
-  try { ff = require('ffmpeg-static') || ff; } catch { /* dùng ffmpeg của hệ thống */ }
-  chayYtdlpHoacLenh(ff, '-version').catch(() => console.warn('⚠️ Chưa có ffmpeg: hãy chạy npm install (gói ffmpeg-static) hoặc cài ffmpeg trên máy chủ.'));
+  scClientId().then(() => console.log('✅ SoundCloud sẵn sàng')).catch((e) => console.warn('⚠️ Chưa lấy được client_id SoundCloud:', e.message)); // làm nóng trước
+  chayYtdlpHoacLenh(ffmpegBin(), '-version').then(() => new Promise((res) => {
+    let o = '';
+    const p = spawn(ffmpegBin(), ['-hide_banner', '-encoders']);
+    p.stdout.on('data', (d) => { o += d; });
+    p.on('error', () => res());
+    p.on('close', () => { if (!/libopus/.test(o)) console.warn('⚠️ ffmpeg không có bộ mã hóa libopus, nhạc sẽ không phát được.'); res(); });
+  })).catch(() => console.warn('⚠️ Chưa có ffmpeg: hãy cài ffmpeg trên máy chủ (hoặc đặt FFMPEG_PATH).'));
   try {
     // Đăng ký slash command (có thể mất vài phút để hiện lần đầu)
     await client.application.commands.set(LENH_SLASH);
