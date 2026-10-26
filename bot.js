@@ -2769,6 +2769,14 @@ function moYtdlp(input) {
 }
 // ---------- Âm thanh chất lượng cao: ffmpeg -> Opus (không mã hóa Opus bằng JS nên nhẹ CPU, đỡ rè/giật) ----------
 const NHAC_KBPS = Math.min(256, Math.max(64, parseInt(process.env.NHAC_KBPS, 10) || 128)); // bitrate Opus gửi lên Discord (đặt NHAC_KBPS để đổi)
+// Danh sách ffmpeg có thể dùng (ưu tiên theo thứ tự); nếu bản đầu bị crash sẽ thử bản kế tiếp
+function ffmpegBins() {
+  const ds = [];
+  if (process.env.FFMPEG_PATH) ds.push(process.env.FFMPEG_PATH);
+  try { const p = require('ffmpeg-static'); if (p && fs.existsSync(p)) ds.push(p); } catch { /* không có ffmpeg-static */ }
+  ds.push('ffmpeg');
+  return [...new Set(ds)];
+}
 let _ffBin = null;
 function ffmpegBin() {
   if (_ffBin) return _ffBin;
@@ -2886,42 +2894,101 @@ async function layLuongPipe(t) { // phương án cuối: yt-dlp tải rồi chuy
 }
 
 // Tạo luồng Opus từ link trực tiếp (hoặc từ yt-dlp qua pipe). vol: 0-200 (%), seek: giây bắt đầu.
-function taoOgg(luong, vol, seek, baoLoi) {
-  const args = ['-hide_banner', '-loglevel', 'error'];
-  if (luong.url) {
-    args.push('-reconnect', '1', '-reconnect_streamed', '1', '-reconnect_delay_max', '5', '-probesize', '262144', '-analyzeduration', '1000000');
-    const h = Object.entries(luong.headers || {}).filter(([k]) => !/^(range|accept-encoding|host)$/i.test(k)).map(([k, v]) => `${k}: ${v}\r\n`).join('');
-    if (h) args.push('-headers', h);
-    if (seek > 0) args.push('-ss', seek.toFixed(2));
-    args.push('-i', luong.url);
-  } else {
-    args.push('-i', 'pipe:0');
-  }
-  args.push('-vn');
-  // limiter nhẹ cho mọi bài: nguồn bị clip (TikTok/DJ remix...) khi mã hóa Opus rất dễ rè; level=0 để không tự nâng âm lượng
-  args.push('-af', `${vol !== 100 ? `volume=${vol / 100},` : ''}alimiter=limit=0.95:level=0`);
-  args.push('-c:a', 'libopus', '-b:a', `${NHAC_KBPS}k`, '-vbr', 'on', '-compression_level', '10', '-frame_duration', '20', '-application', 'audio', '-ar', '48000', '-ac', '2', '-f', 'ogg', 'pipe:1');
-  const ff = spawn(ffmpegBin(), args, { stdio: [luong.url ? 'ignore' : 'pipe', 'pipe', 'pipe'] });
-  let killed = false, loi = '';
-  const kill = () => {
-    killed = true;
-    try { ff.kill('SIGKILL'); } catch { /* */ }
-    if (luong.pipe) { try { luong.pipe.proc.kill('SIGKILL'); } catch { /* */ } }
-  };
-  ff.stderr.on('data', (d) => { loi = (loi + d).slice(-500); });
-  ff.stdout.on('error', () => {});
-  ff.on('error', (e) => { if (!killed) baoLoi(e.code === 'ENOENT' ? 'Máy chủ chưa có ffmpeg' : e.message); });
-  ff.on('close', (code) => {
-    if (!killed && code !== 0) baoLoi(loi.trim().split('\n').pop() || `ffmpeg lỗi (${code})`);
-    if (luong.pipe) { try { luong.pipe.proc.kill('SIGKILL'); } catch { /* */ } }
+// Mở ffmpeg tạo luồng Opus. Chỉ trả về khi ffmpeg đã thật sự ra dữ liệu (nếu lỗi ngay từ đầu thì reject để thử cách khác).
+// an = true: chế độ an toàn (bỏ các tùy chọn nâng cao dễ gây lỗi trên một số bản ffmpeg).
+function taoOgg(luong, vol, seek, baoLoi, an = false, bin = ffmpegBin()) {
+  return new Promise((resolve, reject) => {
+    const args = ['-hide_banner', '-loglevel', 'error'];
+    if (luong.url) {
+      args.push('-reconnect', '1', '-reconnect_streamed', '1', '-reconnect_delay_max', '5');
+      if (!an) args.push('-probesize', '262144', '-analyzeduration', '1000000');
+      const h = Object.entries(luong.headers || {}).filter(([k]) => !/^(range|accept-encoding|host)$/i.test(k)).map(([k, v]) => `${k}: ${v}\r\n`).join('');
+      if (h) args.push('-headers', h);
+      if (seek > 0) args.push('-ss', seek.toFixed(2));
+      args.push('-i', luong.url);
+    } else {
+      args.push('-i', 'pipe:0');
+    }
+    args.push('-vn');
+    // limiter nhẹ: nguồn bị clip (TikTok/DJ remix...) khi mã hóa Opus rất dễ rè; level=0 để không tự nâng âm lượng
+    const loc = [];
+    if (vol !== 100) loc.push(`volume=${vol / 100}`);
+    if (!an) loc.push('alimiter=limit=0.95:level=0');
+    else if (vol > 100) loc.push('alimiter=limit=0.95');
+    if (loc.length) args.push('-af', loc.join(','));
+    args.push('-c:a', 'libopus', '-b:a', `${NHAC_KBPS}k`, '-vbr', 'on');
+    if (!an) args.push('-compression_level', '10', '-frame_duration', '20');
+    args.push('-application', 'audio', '-ar', '48000', '-ac', '2', '-f', 'ogg', 'pipe:1');
+
+    const ff = spawn(bin, args, { stdio: [luong.url ? 'ignore' : 'pipe', 'pipe', 'pipe'] });
+    const pass = new PassThrough();
+    let killed = false, loi = '', co = false;
+    const kill = () => {
+      killed = true;
+      try { ff.kill('SIGKILL'); } catch { /* */ }
+      if (luong.pipe) { try { luong.pipe.proc.kill('SIGKILL'); } catch { /* */ } }
+    };
+    const lyDo = (code, signal) => `ffmpeg ${signal ? `bị dừng bởi ${signal}` : `lỗi mã ${code}`}${loi.trim() ? `: ${cat(loi.trim().split('\n').pop(), 120)}` : ''}`;
+    const hetGio = setTimeout(() => { if (!co) { kill(); reject(new Error('ffmpeg không ra âm thanh sau 30 giây (nguồn chậm hoặc bị chặn)')); } }, 30000);
+    ff.stderr.on('data', (d) => { loi = (loi + d).slice(-600); });
+    ff.stdout.on('error', () => {});
+    pass.on('error', () => {});
+    ff.on('error', (e) => {
+      clearTimeout(hetGio);
+      const m = e.code === 'ENOENT' ? `Máy chủ chưa có ffmpeg (${bin})` : e.message;
+      if (!co) reject(new Error(m)); else if (!killed) baoLoi(m);
+    });
+    ff.stdout.once('data', (chunk) => {
+      clearTimeout(hetGio); co = true;
+      pass.write(chunk);
+      ff.stdout.pipe(pass);
+      resolve({ resource: Voice.createAudioResource(pass, { inputType: Voice.StreamType.OggOpus }), kill });
+    });
+    ff.on('close', (code, signal) => {
+      clearTimeout(hetGio);
+      if (luong.pipe) { try { luong.pipe.proc.kill('SIGKILL'); } catch { /* */ } }
+      if (killed) return;
+      if (!co) {
+        console.error(`[nhạc] ffmpeg (${bin}) thoát sớm, tham số:`, args.filter((x) => !/\r\n/.test(x)).join(' '));
+        return reject(new Error(code === 0 ? 'ffmpeg không tạo ra âm thanh' : lyDo(code, signal)));
+      }
+      if (code === 0) return; // kết thúc bình thường
+      if (signal === 'SIGPIPE') { console.log('[nhạc] ffmpeg nhận SIGPIPE (luồng bị đóng từ phía bot: skip hoặc player dừng)'); return; }
+      console.error(`[nhạc] ffmpeg (${bin}) thoát giữa chừng: code=${code} signal=${signal} stderr=${loi.trim().split('\n').pop() || '(trống)'}`);
+      baoLoi(lyDo(code, signal));
+    });
+    if (luong.pipe) {
+      ff.stdin.on('error', () => {});
+      luong.pipe.stream.on('error', () => {});
+      luong.pipe.stream.pipe(ff.stdin);
+    }
   });
-  if (luong.pipe) {
-    ff.stdin.on('error', () => {});
-    luong.pipe.stream.on('error', () => {});
-    luong.pipe.stream.pipe(ff.stdin);
+}
+
+// Thử lần lượt: ffmpeg mặc định -> chế độ an toàn -> ffmpeg khác -> qua yt-dlp. Trả về {o, luong}.
+async function moOggAnToan(t, luong, vol, seek, baoLoi, uuTienAn = false) {
+  const bins = ffmpegBins();
+  const thu = [];
+  for (const b of bins) { if (uuTienAn) { thu.push([luong, true, b]); thu.push([luong, false, b]); } else { thu.push([luong, false, b]); thu.push([luong, true, b]); } }
+  if (luong.url && !t.query) thu.push([null, true, bins[0]]);
+  if (!luong.url) { thu.length = 0; for (const b of bins) { thu.push([luong, false, b]); thu.push([null, true, b]); } }
+  let loiCuoi = new Error('Không mở được luồng âm thanh');
+  let dungLuong = luong;
+  const daThu = new Set();
+  for (const [l0, an, bin] of thu) {
+    const khoa = `${l0 ? 'u' : 'p'}|${an}|${bin}`;
+    if (daThu.has(khoa)) continue;
+    daThu.add(khoa);
+    try {
+      const l = l0 || await layLuongPipe(t);
+      const o = await taoOgg(l, vol, seek, baoLoi, an, bin);
+      return { o, luong: l };
+    } catch (e) {
+      loiCuoi = e;
+      console.error(`[nhạc] mở luồng lỗi (${an ? 'an toàn' : 'đầy đủ'}, ${bin}):`, e.message);
+    }
   }
-  const resource = Voice.createAudioResource(ff.stdout, { inputType: Voice.StreamType.OggOpus });
-  return { resource, kill };
+  throw loiCuoi;
 }
 
 // ---------- Trạng thái phát nhạc của từng server ----------
@@ -3009,7 +3076,18 @@ async function phatBai(g) {
     let luong = t.luongP ? await t.luongP : null; // link đã được tải trước (nếu có)
     if (!luong) luong = await layLuongUrl(t).catch((e) => { console.error('[nhạc] không lấy được link trực tiếp:', e.message); return null; });
     if (!luong) luong = await layLuongPipe(t);
-    const o = taoOgg(luong, g.vol, 0, (m) => g.textCh.send(`❌ Lỗi khi phát **${t.title}**: ${cat(m, 150)}`).catch(() => {}));
+    let soLanLai = 0;
+    const baoLoi = async (m) => {
+      if (g.cur !== t) return;
+      if (soLanLai < 2 && g.luong) { // ffmpeg dừng giữa chừng: mở lại đúng vị trí
+        soLanLai++;
+        console.error(`[nhạc] ffmpeg dừng giữa chừng (${m}) -> mở lại lần ${soLanLai} ở chế độ an toàn`);
+        if (await khoiLaiAmLuong(g, { baoLoi, uuTienAn: true })) return;
+      }
+      g.textCh.send(`❌ Lỗi khi phát **${t.title}**: ${cat(m, 150)}`).catch(() => {});
+    };
+    const kq = await moOggAnToan(t, luong, g.vol, 0, baoLoi);
+    const o = kq.o; luong = kq.luong;
     console.log(`[nhạc] sẵn sàng phát sau ${((Date.now() - tBat) / 1000).toFixed(1)}s (${luong.url ? 'link trực tiếp' : 'qua yt-dlp'})`);
     g.proc = { kill: o.kill };
     g.resource = o.resource; g.luong = luong.url ? luong : null; g.batDau = 0;
@@ -3026,14 +3104,16 @@ async function phatBai(g) {
 }
 
 // Đổi âm lượng khi đang phát: mở lại luồng ffmpeg tại đúng vị trí hiện tại (chỉ làm được với link trực tiếp)
-function khoiLaiAmLuong(g) {
+async function khoiLaiAmLuong(g, tuyChon = {}) {
   if (!g.cur || !g.resource || !g.luong) return false;
   try {
     const pos = (g.batDau || 0) + g.resource.playbackDuration / 1000;
     const trangThai = g.player.state.status;
     const cu = g.proc;
     const t = g.cur;
-    const o = taoOgg(g.luong, g.vol, pos, (m) => g.textCh.send(`❌ Lỗi khi phát **${t.title}**: ${cat(m, 150)}`).catch(() => {}));
+    const baoLoi = tuyChon.baoLoi || ((m) => g.textCh.send(`❌ Lỗi khi phát **${t.title}**: ${cat(m, 150)}`).catch(() => {}));
+    const { o } = await moOggAnToan(t, g.luong, g.vol, pos, baoLoi, !!tuyChon.uuTienAn);
+    if (g.cur !== t) { o.kill(); return false; } // bài đã đổi trong lúc mở luồng mới
     g.proc = { kill: o.kill }; g.resource = o.resource; g.batDau = pos;
     g.player.play(o.resource);
     if (cu) { try { cu.kill(); } catch { /* */ } }
@@ -3105,8 +3185,9 @@ async function xuLyNhac(i) {
       if (!g) return loiRieng(i, 'Bot đang không ở trong kênh voice nào. Dùng `/join` hoặc `/playmusic` trước.');
       const v = Math.max(0, Math.min(200, i.options.getInteger('volume', true)));
       g.vol = v;
-      const ngay = khoiLaiAmLuong(g);
-      return i.reply({ embeds: [new EmbedBuilder().setColor(MAU.vang).setDescription(`🔊 Âm lượng: **${v}%**${v > 100 ? ' (trên 100% có thể bị rè)' : ''}${g.cur && !ngay ? '\n*Âm lượng mới áp dụng từ bài kế tiếp.*' : ''}`)] });
+      await i.deferReply();
+      const ngay = await khoiLaiAmLuong(g);
+      return i.editReply({ embeds: [new EmbedBuilder().setColor(MAU.vang).setDescription(`🔊 Âm lượng: **${v}%**${v > 100 ? ' (trên 100% có thể bị rè)' : ''}${g.cur && !ngay ? '\n*Âm lượng mới áp dụng từ bài kế tiếp.*' : ''}`)] });
     }
     case 'stop': {
       if (!g || !g.cur) return loiRieng(i, 'Không có bài nào đang phát.');
